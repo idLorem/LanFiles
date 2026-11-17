@@ -20,7 +20,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: System.Reflection.AssemblyVersion("1.4.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.4.1.0")]
 
 static class L
 {
@@ -35,6 +35,7 @@ static class Program
     public static string Root { get { var l = Roots; return l.Count > 0 ? l[0] : null; } }
     public static event Action<string, string> Received;
     public static int Receiving;
+    public static long LastReceived;
     public static string ManualIp = "";
     public static string Pin = "";
     public const string BadPin = "Неверный пароль компьютера";
@@ -116,14 +117,63 @@ static class Program
 
     static string KnownFile { get { return Path.Combine(Path.GetDirectoryName(SettingsFile), "passwords.dat"); } }
 
-    public static string PinFor(string ip) { lock (known) { string p; return known.TryGetValue(ip, out p) ? p : ""; } }
+    static readonly Dictionary<string, string> ids = new Dictionary<string, string>();
+    static bool noDisk;
+
+    static string Key(string ip) { string id; return ids.TryGetValue(ip, out id) ? "#" + id + "@" + ip : ip; }
+
+    static void Forget(string ip)
+    {
+        foreach (var k in known.Keys.Where(k => k == ip || k.EndsWith("@" + ip)).ToList()) known.Remove(k);
+    }
+
+    public static void SeenPeer(string ip, string id)
+    {
+        if (id.Length != 32 || !id.All(Uri.IsHexDigit)) return;
+        lock (known)
+        {
+            string old;
+            if (ids.TryGetValue(ip, out old) && old == id) return;
+            ids[ip] = id;
+            string p;
+            if (!known.ContainsKey(Key(ip)) && known.TryGetValue(ip, out p))
+            {
+                known.Remove(ip); known[Key(ip)] = p;
+                try { SaveKnown(); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+            }
+        }
+    }
+
+    public static string MachineId()
+    {
+        string f = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "LanFiles", "id.txt");
+        try { string s = File.ReadAllText(f).Trim(); if (s.Length == 32 && s.All(Uri.IsHexDigit)) return s; }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+        string id = Guid.NewGuid().ToString("N");
+        try { Directory.CreateDirectory(Path.GetDirectoryName(f)); File.WriteAllText(f, id); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+        return id;
+    }
+
+    public static string PinFor(string ip) { lock (known) { string p; return known.TryGetValue(Key(ip), out p) ? p : ""; } }
 
     public static void RememberPin(string ip, string pin, bool save)
     {
         lock (known)
         {
-            known[ip] = pin;
-            if (!save) return;
+            Forget(ip);
+            known[Key(ip)] = pin;
+            if (save) SaveKnown();
+        }
+    }
+
+    static void SaveKnown()
+    {
+        lock (known)
+        {
+            if (noDisk) return;
             var text = string.Join("\n", known.Select(kv => kv.Key + "\t" + kv.Value));
             Directory.CreateDirectory(Path.GetDirectoryName(KnownFile));
             File.WriteAllBytes(KnownFile, System.Security.Cryptography.ProtectedData.Protect(
@@ -285,7 +335,11 @@ static class Program
         }
     }
 
-    static bool IsFree(string p) { return !File.Exists(p) && !Directory.Exists(p) && !File.Exists(p + ".part"); }
+    static bool IsFree(string p)
+    {
+        lock (receiving) if (receiving.Contains(p)) return false;
+        return !File.Exists(p) && !Directory.Exists(p) && !File.Exists(p + ".part");
+    }
 
     public static void Copy(Stream src, Stream dst, long n, Action<long> progress)
     {
@@ -302,7 +356,7 @@ static class Program
 
     public static string ReceiveFile(Stream src, long n, string target, Action<long> progress)
     {
-        target = UniquePath(target);
+        lock (receiving) { target = UniquePath(target); receiving.Add(target); }
         string part = target + ".part";
         try
         {
@@ -310,8 +364,11 @@ static class Program
             File.Move(part, target);
         }
         catch { try { File.Delete(part); } catch (IOException) { } throw; }
+        finally { lock (receiving) receiving.Remove(target); }
         return target;
     }
+
+    static readonly HashSet<string> receiving = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
     static int SelfTest()
     {
@@ -319,8 +376,30 @@ static class Program
         string share = Path.Combine(tmp, "share"), local = Path.Combine(tmp, "local"), src = Path.Combine(tmp, "src");
         string report = Path.Combine(Path.GetTempPath(), "lanfiles_selftest.txt");
         Directory.CreateDirectory(share); Directory.CreateDirectory(local); Directory.CreateDirectory(Path.Combine(src, "sub"));
+        Directory.CreateDirectory(Path.Combine(src, "empty", "deeper"));
+        noDisk = true;
         try
         {
+            RememberPin("10.0.0.9", "old", false);
+            SeenPeer("10.0.0.9", new string('a', 32));
+            Assert(PinFor("10.0.0.9") == "old", "password moves to computer id");
+            SeenPeer("10.0.0.9", new string('b', 32));
+            Assert(PinFor("10.0.0.9") == "", "another computer at the same IP gets no password");
+            SeenPeer("10.0.0.7", new string('a', 32));
+            Assert(PinFor("10.0.0.7") == "", "a known id at a new IP gets no password");
+            SeenPeer("10.0.0.9", new string('a', 32));
+            Assert(PinFor("10.0.0.9") == "old", "password kept for the same id and IP");
+            RememberPin("10.0.0.9", "new", false);
+            Assert(PinFor("10.0.0.9") == "new" && known.Count(k => k.Key.EndsWith("@10.0.0.9")) == 1, "re-entering a password replaces the old entry");
+            SeenPeer("10.0.0.8", "bad\tid");
+            Assert(PinFor("10.0.0.8") == "", "malformed id ignored");
+
+            string app = Path.Combine(tmp, "app.exe");
+            File.WriteAllText(app, "old"); File.WriteAllText(app + ".new", "new");
+            Updater.Swap(app, app + ".new");
+            Assert(File.ReadAllText(app) == "new" && File.ReadAllText(app + ".old") == "old", "update swap");
+            Assert(Throws(() => Updater.Swap(app, app + ".new")) && File.ReadAllText(app) == "new", "update rollback keeps exe");
+
             Assert(Throws(() => SafePath(share, "..\\x")), "traversal ..");
             Assert(Throws(() => SafePath(share, "C:\\Windows")), "absolute path");
             Assert(SafePath(share, "a\\b.txt") == Path.Combine(share, "a\\b.txt"), "normal path");
@@ -342,6 +421,7 @@ static class Program
             Client.Upload(ip, Path.Combine(src, "a.txt"), "", s);
             Assert(File.Exists(Path.Combine(share, "a (1).txt")), "no overwrite");
             Assert(File.ReadAllBytes(Path.Combine(share, "src", "sub", "big.bin")).SequenceEqual(data), "upload content");
+            Assert(Directory.Exists(Path.Combine(share, "src", "empty", "deeper")), "empty folders arrive");
 
             var list = Client.List(ip, "");
             Assert(list.Any(e => e.Name == "src" && e.IsDir) && list.Any(e => e.Name == "a.txt" && e.Size > 0), "list");
@@ -362,6 +442,8 @@ static class Program
             Assert(!File.Exists(Path.Combine(share, "b.txt")), "delete");
 
             Assert(Throws(() => Client.List(ip, "..")), "remote traversal");
+            Assert(Client.Free(ip, "") > 0, "free space query");
+            Assert(Client.TotalSize(new[] { src }) > 0 && !Throws(() => Client.CheckSpace(ip, "", new[] { src }, "t")), "space check passes");
             string putErr = "";
             try { Client.SendFile(ip, Path.Combine(src, "a.txt"), "", s); } catch (IOException e) { putErr = e.Message; }
             Assert(putErr == L.T("Empty file name", "Пустое имя файла"), "put error reaches client: " + putErr);
@@ -401,6 +483,24 @@ static class Program
             Assert(Updater.Parse(rel.Replace("github.com/" + Updater.Repo, "evil.example/x"), "1.3.0").Asset == null, "update asset only from repo");
             Assert(Updater.Parse("{\"tag_name\":\"1.2.9\",\"html_url\":\"x\"}", "1.3.0") == null, "update older");
             Assert(CleanName(" a|b\tc ") == "abc" && CleanName(new string('x', 60)).Length == 40, "clean name");
+            using (var raw = new TcpClient(ip, TcpPort))
+            {
+                var st = raw.GetStream();
+                uint v = 500000000;
+                while (v >= 0x80) { st.WriteByte((byte)(v | 0x80)); v >>= 7; }
+                st.WriteByte((byte)v);
+                Assert(!new BinaryReader(raw.GetStream(), Encoding.UTF8).ReadBoolean(), "huge header rejected");
+            }
+            for (int i = 0; i < Server.MaxFails; i++)
+                using (var raw = new TcpClient(ip, TcpPort))
+                {
+                    var rw = new BinaryWriter(raw.GetStream(), Encoding.UTF8);
+                    rw.Write("0000"); rw.Write("LIST"); rw.Write(""); rw.Flush();
+                    new BinaryReader(raw.GetStream(), Encoding.UTF8).ReadBoolean();
+                }
+            string lockErr = "";
+            try { Client.List(ip, ""); } catch (IOException e) { lockErr = e is PinException ? "pin" : e.Message; }
+            Assert(lockErr.Contains("10"), "locked out after wrong passwords: " + lockErr);
             File.WriteAllText(report, "OK");
             return 0;
         }
@@ -609,6 +709,9 @@ static class Ipc
 static class Server
 {
     static readonly object failLock = new object();
+    public const int MaxFails = 5;
+    static readonly Dictionary<string, int> fails = new Dictionary<string, int>();
+    static readonly Dictionary<string, DateTime> blocked = new Dictionary<string, DateTime>();
 
     public static void Start(IPAddress bind)
     {
@@ -631,18 +734,36 @@ static class Server
         {
             c.ReceiveTimeout = c.SendTimeout = 60000;
             var s = c.GetStream();
-            var r = new BinaryReader(s, Encoding.UTF8);
+            var r = new SafeReader(s);
             var w = new BinaryWriter(s, Encoding.UTF8);
             try
             {
                 string pin = r.ReadString(), cmd = r.ReadString(), rel = r.ReadString();
                 long len = cmd == "PUT" ? r.ReadInt64() : 0;
                 string newName = cmd == "REN" ? r.ReadString() : null;
+                string from = ((IPEndPoint)c.Client.RemoteEndPoint).Address.ToString();
+                lock (fails)
+                {
+                    DateTime until;
+                    if (blocked.TryGetValue(from, out until))
+                    {
+                        if (until > DateTime.Now) throw new UnauthorizedAccessException(L.T("Too many wrong passwords. Try again in 10 minutes", "Слишком много неверных паролей. Попробуйте через 10 минут"));
+                        blocked.Remove(from);
+                    }
+                }
                 if (pin != Program.Pin)
                 {
                     lock (failLock) Thread.Sleep(1000);
+                    lock (fails)
+                    {
+                        int n;
+                        fails.TryGetValue(from, out n);
+                        if (++n >= MaxFails) { fails.Remove(from); blocked[from] = DateTime.Now.AddMinutes(10); }
+                        else fails[from] = n;
+                    }
                     throw new UnauthorizedAccessException(Program.BadPin);
                 }
+                lock (fails) fails.Remove(from);
                 var roots = Program.Roots;
                 string root, p = Program.Resolve(roots, rel, out root);
                 if (root == null)
@@ -661,6 +782,14 @@ static class Server
                     foreach (var d in dirs) { w.Write(d.Name); w.Write(true); w.Write(0L); }
                     foreach (var f in files) { w.Write(f.Name); w.Write(false); w.Write(f.Length); }
                 }
+                else if (cmd == "MKD")
+                {
+                    Directory.CreateDirectory(p); w.Write(true);
+                }
+                else if (cmd == "FREE")
+                {
+                    w.Write(true); w.Write(new DriveInfo(Path.GetPathRoot(p)).AvailableFreeSpace);
+                }
                 else if (cmd == "GET")
                 {
                     using (var f = File.OpenRead(p)) { w.Write(true); w.Write(f.Length); w.Flush(); f.CopyTo(s); }
@@ -674,7 +803,7 @@ static class Server
                     Interlocked.Increment(ref Program.Receiving);
                     string saved;
                     try { saved = Program.ReceiveFile(s, len, p, null); }
-                    finally { Interlocked.Decrement(ref Program.Receiving); }
+                    finally { Interlocked.Exchange(ref Program.LastReceived, DateTime.UtcNow.Ticks); Interlocked.Decrement(ref Program.Receiving); }
                     w.Write(true);
                     string inside = Path.GetFullPath(saved).Substring(Path.GetFullPath(root).TrimEnd('\\').Length + 1);
                     int cut = inside.IndexOf('\\');
@@ -713,6 +842,22 @@ static class Server
 
 class Entry { public string Name; public bool IsDir; public long Size; }
 
+class SafeReader : BinaryReader
+{
+    public SafeReader(Stream s) : base(s, Encoding.UTF8) { }
+
+    public override string ReadString()
+    {
+        int n = Read7BitEncodedInt();
+        if (n < 0 || n > 65536) throw new IOException("Bad request");
+        var b = ReadBytes(n);
+        if (b.Length != n) throw new EndOfStreamException();
+        return Encoding.UTF8.GetString(b);
+    }
+}
+
+class NoSpaceException : IOException { public NoSpaceException(string m) : base(m) { } }
+
 class PinException : IOException { public PinException() : base(L.T("Wrong computer password", "Неверный пароль компьютера")) { } }
 
 class Conn : IDisposable
@@ -727,7 +872,7 @@ class Conn : IDisposable
         C.EndConnect(ar);
         C.ReceiveTimeout = C.SendTimeout = 60000;
         S = C.GetStream();
-        R = new BinaryReader(S, Encoding.UTF8); W = new BinaryWriter(S, Encoding.UTF8);
+        R = new SafeReader(S); W = new BinaryWriter(S, Encoding.UTF8);
         W.Write(Program.PinFor(ip)); W.Write(cmd); W.Write(rel);
     }
 
@@ -793,8 +938,40 @@ static class Client
         {
             foreach (var f in Directory.GetFiles(localPath, "*", SearchOption.AllDirectories))
                 SendFile(ip, f, Join(remoteDir, name + f.Substring(trimmed.Length)), status);
+            foreach (var d in new[] { trimmed }.Concat(Directory.GetDirectories(localPath, "*", SearchOption.AllDirectories)))
+                if (!Directory.EnumerateFileSystemEntries(d).Any())
+                    try { MakeDir(ip, Join(remoteDir, name + d.Substring(trimmed.Length))); }
+                    catch (PinException) { throw; }
+                    catch (IOException) { }
         }
         else SendFile(ip, localPath, Join(remoteDir, name), status);
+    }
+
+    public static long Free(string ip, string remoteDir)
+    {
+        using (var c = new Conn(ip, "FREE", remoteDir == "" ? "*" : remoteDir))
+        {
+            c.W.Flush();
+            if (c.R.ReadBoolean()) return c.R.ReadInt64();
+            string msg = c.R.ReadString();
+            if (msg == Program.BadPin) throw new PinException();
+            return -1;
+        }
+    }
+
+    public static long TotalSize(IEnumerable<string> paths)
+    {
+        return paths.Sum(p => Directory.Exists(p)
+            ? Directory.GetFiles(p, "*", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length)
+            : new FileInfo(p).Length);
+    }
+
+    public static void CheckSpace(string ip, string remoteDir, IEnumerable<string> paths, string pcName)
+    {
+        long free = Free(ip, remoteDir), need = TotalSize(paths);
+        if (free >= 0 && need > free)
+            throw new NoSpaceException(L.T("Not enough space on ", "Недостаточно места на ") + pcName + "\n\n"
+                + L.T("Needed: ", "Нужно: ") + RemoteForm.FormatSize(need) + "\n" + L.T("Free: ", "Свободно: ") + RemoteForm.FormatSize(free));
     }
 
     public static void SendFile(string ip, string local, string rel, Action<string, int> status)
@@ -807,6 +984,11 @@ static class Client
             Program.Copy(f, c.S, f.Length, Progress(status, L.T("Sending: ", "Отправка: ") + Path.GetFileName(local), f.Length));
             c.CheckOk();
         }
+    }
+
+    public static void MakeDir(string ip, string rel)
+    {
+        using (var c = new Conn(ip, "MKD", rel)) c.CheckOk();
     }
 
     public static void Delete(string ip, string rel)
@@ -822,7 +1004,7 @@ static class Client
 
 static class Discovery
 {
-    static readonly string myId = Guid.NewGuid().ToString("N");
+    static readonly string myId = Program.MachineId();
     static UdpClient udp;
     public static event Action<string, string> Found;
 
@@ -869,6 +1051,7 @@ static class Discovery
             var p = Encoding.UTF8.GetString(b).Split('|');
             if (p.Length != 4 || p[0] != "LANFILES" || p[1] == myId) continue;
             if (p[3] == "?") Send("!", new IPEndPoint(ep.Address, Program.UdpPort));
+            Program.SeenPeer(ep.Address.ToString(), p[1]);
             string name = Program.CleanName(p[2]);
             var h = Found; if (h != null) h(ep.Address.ToString(), name == "" ? ep.Address.ToString() : name);
         }
@@ -1356,11 +1539,7 @@ class BusyForm : Form
     {
         try
         {
-            while (true)
-            {
-                try { await Task.Run(() => work(Report)); break; }
-                catch (PinException) { if (IsDisposed || !AskPin()) throw; }
-            }
+            await PinPrompt.Retry(() => { work(Report); return true; }, () => !IsDisposed && AskPin());
             if (!IsDisposed) { StatusLabel.Text = done; Bar.Value = -1; }
             return true;
         }
@@ -1452,7 +1631,7 @@ class MainForm : Form
         try { Discovery.Start(); }
         catch (SocketException) { hint.Text = L.T("Auto-discovery unavailable, enter the IP in Settings", "Автопоиск недоступен, укажите IP в настройках"); }
         Rebuild();
-        if (Program.CheckUpdates && Updater.Repo != "") CheckUpdatesQuietly();
+        if (Program.CheckUpdates) CheckUpdatesQuietly();
     }
 
     async void CheckUpdatesQuietly()
@@ -1605,7 +1784,12 @@ class MainForm : Form
             card.DragDrop += (s, e) =>
             {
                 card.DropHighlight = false; card.Invalidate();
-                SendBatch(ip, ((string[])e.Data.GetData(DataFormats.FileDrop)).ToList());
+                var files = ((string[])e.Data.GetData(DataFormats.FileDrop)).ToList();
+                BeginInvoke((Action)(async () =>
+                {
+                    string dir = await FolderPick.Ask(ip, name);
+                    if (dir != null) SendBatch(ip, files, dir);
+                }));
             };
             cards.Controls.Add(card);
         }
@@ -1644,14 +1828,27 @@ class MainForm : Form
         catch (InvalidOperationException) { }
     }
 
-    void FlushBatches()
+    bool picking;
+
+    async void FlushBatches()
     {
         batchTimer.Stop();
-        foreach (var kv in pending.ToList()) SendBatch(kv.Key, kv.Value.Distinct().ToList());
+        if (picking) { batchTimer.Start(); return; }
+        var batches = pending.ToList();
         pending.Clear();
+        picking = true;
+        try
+        {
+            foreach (var kv in batches)
+            {
+                string dir = await FolderPick.Ask(kv.Key, NameOf(kv.Key));
+                if (dir != null) SendBatch(kv.Key, kv.Value.Distinct().ToList(), dir);
+            }
+        }
+        finally { picking = false; }
     }
 
-    async void SendBatch(string ip, List<string> paths)
+    async void SendBatch(string ip, List<string> paths, string dir = "")
     {
         string name = NameOf(ip);
         Action<string, int> report = (s, pct) =>
@@ -1670,13 +1867,15 @@ class MainForm : Form
         };
         try
         {
-            while (true)
-            {
-                try { await Task.Run(() => { foreach (var p in paths) Client.Upload(ip, p, "", report); }); break; }
-                catch (PinException) { if (IsDisposed || !PinPrompt.Ask(Visible ? this : null, ip, name)) throw; }
-            }
+            await PinPrompt.Retry(() => { Client.CheckSpace(ip, dir, paths, name); foreach (var p in paths) Client.Upload(ip, p, dir, report); return true; },
+                () => !IsDisposed && PinPrompt.Ask(Visible ? this : null, ip, name));
             string what = paths.Count == 1 ? Path.GetFileName(paths[0].TrimEnd('\\')) : L.T("Items: ", "Объектов: ") + paths.Count;
             Notify(L.T("Sent to ", "Отправлено на ") + name, what, null);
+        }
+        catch (NoSpaceException e)
+        {
+            if (Visible) MessageBox.Show(this, e.Message, "LanFiles", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            else MessageBox.Show(e.Message, "LanFiles", MessageBoxButtons.OK, MessageBoxIcon.Error, MessageBoxDefaultButton.Button1, MessageBoxOptions.DefaultDesktopOnly);
         }
         catch (Exception e)
         {
@@ -1691,6 +1890,15 @@ class MainForm : Form
 
 static class PinPrompt
 {
+    public static async Task<T> Retry<T>(Func<T> work, Func<bool> ask)
+    {
+        while (true)
+        {
+            try { return await Task.Run(work); }
+            catch (PinException) { if (!ask()) throw; }
+        }
+    }
+
     public static bool Ask(IWin32Window owner, string ip, string pcName)
     {
         using (var f = new Form())
@@ -1719,6 +1927,109 @@ static class PinPrompt
             catch (IOException) { Program.RememberPin(ip, box.Value, false); }
             catch (UnauthorizedAccessException) { Program.RememberPin(ip, box.Value, false); }
             return true;
+        }
+    }
+}
+
+static class FolderPick
+{
+    public static async Task<string> Ask(string ip, string pcName)
+    {
+        List<Entry> top;
+        try { top = await PinPrompt.Retry(() => Client.List(ip, ""), () => PinPrompt.Ask(null, ip, pcName)); }
+        catch (PinException) { return null; }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "LanFiles", MessageBoxButtons.OK, MessageBoxIcon.Error, MessageBoxDefaultButton.Button1, MessageBoxOptions.DefaultDesktopOnly);
+            return null;
+        }
+        if (!top.Any(x => x.IsDir)) return "";
+        return Show(ip, pcName);
+    }
+
+    static string Show(string ip, string pcName)
+    {
+        using (var f = new Form())
+        {
+            Theme.Apply(f);
+            f.Text = L.T("Send to ", "Отправить на ") + pcName; f.Icon = Program.AppIcon;
+            f.StartPosition = FormStartPosition.CenterScreen; f.TopMost = true; f.MinimizeBox = f.MaximizeBox = false;
+            f.ClientSize = new Size(Theme.S(480), Theme.S(440)); f.MinimumSize = new Size(Theme.S(360), Theme.S(320));
+            string cur = "";
+
+            var head = new Panel { Dock = DockStyle.Top, Height = Theme.S(56) };
+            var bUp = new FluentButton("", '', FluentButton.Kind.Subtle);
+            bUp.Location = new Point(Theme.S(12), (head.Height - bUp.Height) / 2);
+            var crumb = new Label { Font = Theme.Strong, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft,
+                Location = new Point(bUp.Right + Theme.S(8), 0), Size = new Size(f.ClientSize.Width - bUp.Right - Theme.S(20), head.Height),
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
+            head.Controls.Add(bUp); head.Controls.Add(crumb);
+
+            var list = new ListBox { Dock = DockStyle.Fill, BorderStyle = BorderStyle.None, BackColor = Theme.Bg, ForeColor = Theme.Text,
+                DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = Theme.S(36), IntegralHeight = false };
+            list.DrawItem += (s, e) =>
+            {
+                if (e.Index < 0) return;
+                bool sel = (e.State & DrawItemState.Selected) != 0;
+                using (var b = new SolidBrush(sel ? Theme.LayerHover : Theme.Bg)) e.Graphics.FillRectangle(b, e.Bounds);
+                Theme.DrawGlyph(e.Graphics, '', new Rectangle(e.Bounds.X + Theme.S(12), e.Bounds.Y, Theme.S(24), e.Bounds.Height), Theme.TextSecondary, Theme.S(16));
+                TextRenderer.DrawText(e.Graphics, (string)list.Items[e.Index], Theme.Body,
+                    new Rectangle(e.Bounds.X + Theme.S(44), e.Bounds.Y, e.Bounds.Width - Theme.S(52), e.Bounds.Height), Theme.Text,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            };
+            var host = new Panel { Dock = DockStyle.Fill, Padding = new Padding(Theme.S(12), 0, Theme.S(12), 0) };
+            host.Controls.Add(list);
+
+            var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = Theme.S(68), FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(Theme.S(18), Theme.S(16), Theme.S(18), 0), BackColor = Color.FromArgb(28, 28, 28) };
+            var ok = new FluentButton(L.T("Send", "Отправить"), '\0', FluentButton.Kind.Accent) { Width = Theme.S(130), DialogResult = DialogResult.OK, Enabled = false };
+            var cancel = new FluentButton(L.T("Cancel", "Отмена")) { Width = Theme.S(110), DialogResult = DialogResult.Cancel };
+            var status = new Label { AutoSize = false, Size = new Size(Theme.S(180), ok.Height), TextAlign = ContentAlignment.MiddleLeft, ForeColor = Theme.TextSecondary, Font = Theme.Small, AutoEllipsis = true };
+            ok.Margin = cancel.Margin = new Padding(Theme.S(4), 0, Theme.S(4), 0);
+            bottom.Controls.Add(cancel); bottom.Controls.Add(ok); bottom.Controls.Add(status);
+            f.AcceptButton = ok; f.CancelButton = cancel;
+            f.Controls.Add(host); f.Controls.Add(head); f.Controls.Add(bottom);
+
+            Func<string> target = () => list.SelectedItem == null ? cur : (cur == "" ? "" : cur + "\\") + (string)list.SelectedItem;
+            Action showTarget = () =>
+            {
+                string t = target();
+                status.Text = L.T("Into: ", "В: ") + (t == "" ? L.T("Inbox", "Входящие") : Path.GetFileName(t));
+            };
+            list.SelectedIndexChanged += (s, e) => showTarget();
+
+            Action load = null;
+            load = async () =>
+            {
+                list.Items.Clear();
+                crumb.Text = cur == "" ? pcName : pcName + " › " + cur.Replace("\\", " › ");
+                bUp.Enabled = cur != ""; ok.Enabled = false;
+                status.Text = L.T("Loading…", "Загрузка…");
+                string dir = cur, err = null;
+                List<Entry> items = null;
+                try { items = await PinPrompt.Retry(() => Client.List(ip, dir), () => !f.IsDisposed && PinPrompt.Ask(f, ip, pcName)); }
+                catch (Exception ex) { err = ex.Message; }
+                if (f.IsDisposed || dir != cur) return;
+                if (err != null) { status.Text = err; return; }
+                foreach (var it in items.Where(x => x.IsDir).OrderBy(x => x.Name, StringComparer.CurrentCultureIgnoreCase)) list.Items.Add(it.Name);
+                ok.Enabled = true;
+                showTarget();
+            };
+            Action open = () =>
+            {
+                if (list.SelectedItem == null) return;
+                cur = target(); load();
+            };
+            Action up = () =>
+            {
+                if (cur == "") return;
+                int i = cur.LastIndexOf('\\');
+                cur = i < 0 ? "" : cur.Substring(0, i); load();
+            };
+            list.DoubleClick += (s, e) => open();
+            list.KeyDown += (s, e) => { if (e.KeyCode == Keys.Back) up(); else if (e.KeyCode == Keys.Right) open(); };
+            bUp.Click += (s, e) => up();
+            f.Shown += (s, e) => { f.Activate(); list.Focus(); load(); };
+            return f.ShowDialog() == DialogResult.OK ? target() : null;
         }
     }
 }
@@ -1786,12 +2097,6 @@ class SettingsForm : Form
         var bUpd = new FluentButton(L.T("Check now", "Проверить"), '\uE72C');
         bUpd.Click += async (s, e) =>
         {
-            if (Updater.Repo == "")
-            {
-                MessageBox.Show(this, L.T("Updates will come from GitHub releases. The repository is not set up yet.", "Обновления будут приходить из релизов на GitHub. Репозиторий пока не подключён."),
-                    L.T("Updates", "Обновления"), MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
             bUpd.Enabled = false;
             Updater.Release rel = null; string err = null;
             try { rel = await Task.Run(() => Updater.Check()); }
@@ -1950,7 +2255,7 @@ static class Updater
     static void Install(Release r)
     {
         if (r.Asset == null) throw new IOException(L.T("The release has no LanFiles.exe.", "В релизе нет LanFiles.exe."));
-        string exe = Application.ExecutablePath, fresh = exe + ".new", old = exe + ".old";
+        string exe = Application.ExecutablePath, fresh = exe + ".new";
         try
         {
             using (var wc = new WebClient())
@@ -1961,12 +2266,18 @@ static class Updater
             var v = System.Reflection.AssemblyName.GetAssemblyName(fresh).Version;
             if (Norm(v) != Norm(Version.Parse(r.Version)))
                 throw new IOException(L.T("The downloaded file has a different version.", "Скачанный файл другой версии."));
-            if (File.Exists(old)) File.Delete(old);
-            File.Move(exe, old);
-            try { File.Move(fresh, exe); }
-            catch (Exception) { File.Move(old, exe); throw; }
+            Swap(exe, fresh);
         }
         finally { try { File.Delete(fresh); } catch (Exception) { } }
+    }
+
+    public static void Swap(string exe, string fresh)
+    {
+        string old = exe + ".old";
+        if (File.Exists(old)) File.Delete(old);
+        File.Move(exe, old);
+        try { File.Move(fresh, exe); }
+        catch (Exception) { File.Move(old, exe); throw; }
     }
 
     static Version Norm(Version v) { return new Version(v.Major, v.Minor, Math.Max(v.Build, 0), Math.Max(v.Revision, 0)); }
@@ -1990,7 +2301,12 @@ static class Updater
         Cursor.Current = Cursors.WaitCursor;
         try { await Task.Run(() => Install(r)); }
         catch (Exception ex) { err = ex.Message; }
-        if (err == null) { if (MainForm.Instance != null) MainForm.Instance.Restart(); return; }
+        if (err == null)
+        {
+            while (Program.Receiving > 0 || DateTime.UtcNow.Ticks - Interlocked.Read(ref Program.LastReceived) < TimeSpan.TicksPerSecond * 10) await Task.Delay(1000);
+            if (MainForm.Instance != null) MainForm.Instance.Restart();
+            return;
+        }
         if (MessageBox.Show(err + L.T("\n\nOpen the download page?", "\n\nОткрыть страницу загрузки?"), L.T("Could not update", "Не удалось обновить"),
                 MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes
             && r.Page.StartsWith("https://github.com/", StringComparison.OrdinalIgnoreCase))
@@ -2249,17 +2565,11 @@ class RemoteForm : BusyForm
         crumb.Text = pcName + (dir == "" ? "" : "  ›  " + dir.Replace("\\", "  ›  "));
         UpdateButtons();
         List<Entry> items;
-        try
-        {
-            while (true)
-            {
-                try { items = await Task.Run(() => Client.List(ip, dir)); break; }
-                catch (PinException) { if (IsDisposed || !AskPin()) throw; }
-            }
-        }
+        try { items = await PinPrompt.Retry(() => Client.List(ip, dir), () => !IsDisposed && AskPin()); }
         catch (Exception e)
         {
-            if (IsDisposed) return;
+            if (IsDisposed || dir != cur) return;
+            lv.Items.Clear(); hot = null; empty.Visible = false;
             StatusLabel.Text = L.T("Error: ", "Ошибка: ") + e.Message;
             online = false; crumb.Invalidate();
             return;
@@ -2283,7 +2593,7 @@ class RemoteForm : BusyForm
         if (files == null || files.Length == 0) return;
         string dir = cur;
         string what = files.Length == 1 ? Path.GetFileName(files[0].TrimEnd('\\')) : L.T("Items: ", "Объектов: ") + files.Length;
-        if (await Run(r => { foreach (var f in files) Client.Upload(ip, f, dir, r); },
+        if (await Run(r => { Client.CheckSpace(ip, dir, files, pcName); foreach (var f in files) Client.Upload(ip, f, dir, r); },
                 files.Length == 1 ? L.T("Sent: ", "Отправлено: ") + what : L.T("Items sent: ", "Отправлено объектов: ") + files.Length)
             && MainForm.Instance != null)
             MainForm.Instance.Notify(L.T("Sent to ", "Отправлено на ") + pcName, what, null);
@@ -2353,7 +2663,7 @@ class RemoteForm : BusyForm
         Reload();
     }
 
-    static string FormatSize(long b)
+    public static string FormatSize(long b)
     {
         string[] u = L.Ru ? new[] { "Б", "КБ", "МБ", "ГБ", "ТБ" } : new[] { "B", "KB", "MB", "GB", "TB" };
         double v = b; int i = 0;
