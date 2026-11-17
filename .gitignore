@@ -1,4 +1,5 @@
 *.exe
 *.png
+!screenshots/*.png
 *.new
 *.old
