@@ -1,0 +1,2363 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Collections.Specialized;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Text;
+using System.IO;
+using System.IO.Pipes;
+using System.Linq;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using Microsoft.Win32;
+
+[assembly: System.Reflection.AssemblyVersion("1.4.0.0")]
+
+static class L
+{
+    public static bool Ru;
+    public static string T(string en, string ru) { return Ru ? ru : en; }
+}
+
+static class Program
+{
+    public const int TcpPort = 45678, UdpPort = 45679;
+    public static List<string> Roots = new List<string>();
+    public static string Root { get { var l = Roots; return l.Count > 0 ? l[0] : null; } }
+    public static event Action<string, string> Received;
+    public static int Receiving;
+    public static string ManualIp = "";
+    public static string Pin = "";
+    public const string BadPin = "Неверный пароль компьютера";
+    static readonly Dictionary<string, string> known = new Dictionary<string, string>();
+    public static bool TrayOnClose = true, ExplorerMenu = true, CheckUpdates = true;
+    public static string PcName = "";
+    public static string MyName { get { return PcName != "" ? PcName : Environment.MachineName; } }
+
+    public static string CleanName(string n)
+    {
+        n = new string((n ?? "").Where(ch => !char.IsControl(ch) && ch != '|').ToArray()).Trim();
+        return n.Length > 40 ? n.Substring(0, 40).Trim() : n;
+    }
+    public static bool RestartAfterExit;
+    public static Icon AppIcon, TrayIcon;
+    static readonly string SettingsFile = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "LanFiles", "settings.txt");
+    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+
+    [STAThread]
+    static int Main(string[] args)
+    {
+        if (args.Length > 0 && args[0] == "--selftest") return SelfTest();
+        if (args.Length >= 3 && args[0] == "--send") { LoadSettings(); return Ipc.SendToInstance(args[1], args.Skip(2)) ? 0 : 1; }
+        if (args.Length >= 2 && args[0] == "--after")
+        {
+            int pid;
+            if (int.TryParse(args[1], out pid))
+                try { using (var old = Process.GetProcessById(pid)) old.WaitForExit(10000); } catch (ArgumentException) { }
+            args = args.Skip(2).ToArray();
+        }
+        try { File.Delete(Application.ExecutablePath + ".old"); } catch (Exception) { }
+
+        Native.SetProcessDPIAware();
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
+        Theme.Init();
+        bool startHidden = args.Contains("--tray"), created;
+        using (new Mutex(true, @"Local\LanFiles_instance", out created))
+        {
+            if (!created) { if (!startHidden) Ipc.Post("SHOW"); return 0; }
+            AppIcon = Native.ExeIcon(Theme.S(32));
+            TrayIcon = Native.ExeIcon(Theme.S(16));
+            LoadSettings();
+            if (Root == null || !Directory.Exists(Root) || Pin == "")
+                using (var f = new SettingsForm(true)) if (f.ShowDialog() != DialogResult.OK) return 0;
+            if (Autostart) Autostart = true;
+            try { Server.Start(IPAddress.Any); }
+            catch (SocketException)
+            {
+                MessageBox.Show(L.T("Port ", "Порт ") + TcpPort + L.T(" is used by another program.", " занят другой программой."), "LanFiles");
+                return 0;
+            }
+            var main = new MainForm(startHidden);
+            Ipc.StartServer(main.OnPipe);
+            Application.Run(main);
+        }
+        if (RestartAfterExit) Process.Start(Application.ExecutablePath, "--after " + Process.GetCurrentProcess().Id);
+        return 0;
+    }
+
+    static void LoadSettings()
+    {
+        try
+        {
+            var l = File.ReadAllLines(SettingsFile);
+            if (l.Length > 0) Roots = l[0].Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries).ToList();
+            if (l.Length > 1) ManualIp = l[1].Trim();
+            if (l.Length > 2) Pin = l[2];
+            if (l.Length > 3) TrayOnClose = l[3] != "0";
+            if (l.Length > 4) ExplorerMenu = l[4] != "0";
+            if (l.Length > 5) L.Ru = l[5] == "ru";
+            if (l.Length > 6) PcName = CleanName(l[6]);
+            if (l.Length > 7) CheckUpdates = l[7] != "0";
+        }
+        catch (IOException) { }
+        LoadKnown();
+    }
+
+    static string KnownFile { get { return Path.Combine(Path.GetDirectoryName(SettingsFile), "passwords.dat"); } }
+
+    public static string PinFor(string ip) { lock (known) { string p; return known.TryGetValue(ip, out p) ? p : ""; } }
+
+    public static void RememberPin(string ip, string pin, bool save)
+    {
+        lock (known)
+        {
+            known[ip] = pin;
+            if (!save) return;
+            var text = string.Join("\n", known.Select(kv => kv.Key + "\t" + kv.Value));
+            Directory.CreateDirectory(Path.GetDirectoryName(KnownFile));
+            File.WriteAllBytes(KnownFile, System.Security.Cryptography.ProtectedData.Protect(
+                Encoding.UTF8.GetBytes(text), null, System.Security.Cryptography.DataProtectionScope.CurrentUser));
+        }
+    }
+
+    static void LoadKnown()
+    {
+        try
+        {
+            var text = Encoding.UTF8.GetString(System.Security.Cryptography.ProtectedData.Unprotect(
+                File.ReadAllBytes(KnownFile), null, System.Security.Cryptography.DataProtectionScope.CurrentUser));
+            foreach (var line in text.Split('\n'))
+            {
+                int t = line.IndexOf('\t');
+                if (t > 0) known[line.Substring(0, t)] = line.Substring(t + 1);
+            }
+        }
+        catch (IOException) { }
+        catch (System.Security.Cryptography.CryptographicException) { }
+    }
+
+    public static void SaveSettings()
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile));
+        File.WriteAllLines(SettingsFile, new[] { string.Join("|", Roots), ManualIp, Pin, TrayOnClose ? "1" : "0", ExplorerMenu ? "1" : "0", L.Ru ? "ru" : "en", PcName, CheckUpdates ? "1" : "0" });
+    }
+
+    public static bool Autostart
+    {
+        get { using (var k = Registry.CurrentUser.OpenSubKey(RunKey)) return k != null && k.GetValue("LanFiles") != null; }
+        set
+        {
+            using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
+            {
+                if (value) k.SetValue("LanFiles", "\"" + Application.ExecutablePath + "\" --tray");
+                else k.DeleteValue("LanFiles", false);
+            }
+        }
+    }
+
+    static string lastMenu;
+    public static void UpdateExplorerMenu(List<KeyValuePair<string, string>> peers)
+    {
+        string[] roots = { @"Software\Classes\AllFilesystemObjects\shell\LanFiles", @"Software\Classes\Directory\Background\shell\LanFiles" };
+        try
+        {
+            if (!ExplorerMenu)
+            {
+                foreach (var r in roots) Registry.CurrentUser.DeleteSubKeyTree(r, false);
+                lastMenu = null;
+                return;
+            }
+            string exe = Application.ExecutablePath;
+            string sig = exe + "|" + L.Ru + "|" + string.Join(";", peers.Select(p => p.Key + "=" + p.Value));
+            if (sig == lastMenu) return;
+            lastMenu = sig;
+            for (int i = 0; i < roots.Length; i++)
+            {
+                Registry.CurrentUser.DeleteSubKeyTree(roots[i], false);
+                using (var k = Registry.CurrentUser.CreateSubKey(roots[i]))
+                {
+                    k.SetValue("MUIVerb", i == 0 ? L.T("Send to computer", "Отправить на компьютер") : L.T("Send this folder to computer", "Отправить эту папку на компьютер"));
+                    k.SetValue("Icon", exe + ",0");
+                    k.SetValue("SubCommands", "");
+                    k.SetValue("MultiSelectModel", "Player");
+                    string arg = i == 0 ? "%1" : "%V.";
+                    if (peers.Count == 0) AddVerb(k, "pc0", L.T("No computers found, open LanFiles", "Компьютеры не найдены, открыть LanFiles"), "\"" + exe + "\"", exe);
+                    int n = 0;
+                    foreach (var p in peers)
+                        AddVerb(k, "pc" + n++, p.Value.Replace("&", "&&") + "   (" + p.Key + ")",
+                            "\"" + exe + "\" --send " + p.Key + " \"" + arg + "\"", exe);
+                }
+            }
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+        catch (System.Security.SecurityException) { }
+    }
+
+    static void AddVerb(RegistryKey parent, string key, string title, string command, string exe)
+    {
+        using (var s = parent.CreateSubKey(@"shell\" + key))
+        {
+            s.SetValue("MUIVerb", title);
+            s.SetValue("Icon", exe + ",0");
+            s.SetValue("MultiSelectModel", "Player");
+            using (var c = s.CreateSubKey("command")) c.SetValue("", command);
+        }
+    }
+
+    public static List<string> Aliases(List<string> roots)
+    {
+        var res = new List<string>();
+        foreach (var r in roots)
+        {
+            string n = Path.GetFileName(r.TrimEnd('\\'));
+            if (n == "") n = r.Substring(0, 1).ToUpperInvariant();
+            string a = n;
+            for (int i = 2; res.Contains(a, StringComparer.OrdinalIgnoreCase); i++) a = n + " (" + i + ")";
+            res.Add(a);
+        }
+        return res;
+    }
+
+    public static void OnReceived(string ip, string top)
+    {
+        var h = Received; if (h != null) h(ip, top);
+    }
+
+    public static string Resolve(List<string> roots, string rel, out string root)
+    {
+        if (rel == "*" || rel.StartsWith("*\\")) { root = roots[0]; return SafePath(root, rel.Length > 1 ? rel.Substring(2) : ""); }
+        if (roots.Count == 1) { root = roots[0]; return SafePath(root, rel); }
+        if (rel == "") { root = null; return null; }
+        int i = rel.IndexOf('\\');
+        string head = i < 0 ? rel : rel.Substring(0, i);
+        int k = Aliases(roots).FindIndex(a => string.Equals(a, head, StringComparison.OrdinalIgnoreCase));
+        if (k < 0) { root = roots[0]; return SafePath(root, rel); }
+        root = roots[k];
+        return SafePath(root, i < 0 ? "" : rel.Substring(i + 1));
+    }
+
+    public static string SafePath(string root, string rel)
+    {
+        string rootFull = Path.GetFullPath(root).TrimEnd('\\') + "\\";
+        string full = Path.GetFullPath(Path.Combine(root, rel));
+        if (!(full.TrimEnd('\\') + "\\").StartsWith(rootFull, StringComparison.OrdinalIgnoreCase))
+            throw new UnauthorizedAccessException(L.T("Path is outside the shared folder", "Путь вне общей папки"));
+        return full;
+    }
+
+    public static bool HoldsRoot(List<string> roots, string full)
+    {
+        string p = full.TrimEnd('\\') + "\\";
+        return roots.Any(r => (Path.GetFullPath(r).TrimEnd('\\') + "\\").StartsWith(p, StringComparison.OrdinalIgnoreCase));
+    }
+
+    public static bool IsRoot(string root, string full)
+    {
+        return string.Equals(Path.GetFullPath(root).TrimEnd('\\'), full.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static void CheckName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name) || name == "." || name == ".." || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+            throw new IOException(L.T("Invalid name: ", "Недопустимое имя: ") + name);
+    }
+
+    public static string UniquePath(string p)
+    {
+        if (IsFree(p)) return p;
+        string dir = Path.GetDirectoryName(p), name = Path.GetFileNameWithoutExtension(p), ext = Path.GetExtension(p);
+        for (int i = 1; ; i++)
+        {
+            string c = Path.Combine(dir, name + " (" + i + ")" + ext);
+            if (IsFree(c)) return c;
+        }
+    }
+
+    static bool IsFree(string p) { return !File.Exists(p) && !Directory.Exists(p) && !File.Exists(p + ".part"); }
+
+    public static void Copy(Stream src, Stream dst, long n, Action<long> progress)
+    {
+        var buf = new byte[1 << 16];
+        long done = 0, reported = 0;
+        while (done < n)
+        {
+            int k = src.Read(buf, 0, (int)Math.Min(buf.Length, n - done));
+            if (k <= 0) throw new EndOfStreamException(L.T("Connection lost", "Соединение оборвалось"));
+            dst.Write(buf, 0, k); done += k;
+            if (progress != null && done - reported >= (1 << 20)) { progress(done); reported = done; }
+        }
+    }
+
+    public static string ReceiveFile(Stream src, long n, string target, Action<long> progress)
+    {
+        target = UniquePath(target);
+        string part = target + ".part";
+        try
+        {
+            using (var f = File.Create(part)) Copy(src, f, n, progress);
+            File.Move(part, target);
+        }
+        catch { try { File.Delete(part); } catch (IOException) { } throw; }
+        return target;
+    }
+
+    static int SelfTest()
+    {
+        string tmp = Path.Combine(Path.GetTempPath(), "lanfiles_test_" + Guid.NewGuid().ToString("N"));
+        string share = Path.Combine(tmp, "share"), local = Path.Combine(tmp, "local"), src = Path.Combine(tmp, "src");
+        string report = Path.Combine(Path.GetTempPath(), "lanfiles_selftest.txt");
+        Directory.CreateDirectory(share); Directory.CreateDirectory(local); Directory.CreateDirectory(Path.Combine(src, "sub"));
+        try
+        {
+            Assert(Throws(() => SafePath(share, "..\\x")), "traversal ..");
+            Assert(Throws(() => SafePath(share, "C:\\Windows")), "absolute path");
+            Assert(SafePath(share, "a\\b.txt") == Path.Combine(share, "a\\b.txt"), "normal path");
+            Assert(Throws(() => CheckName("..")) && Throws(() => CheckName("a\\b")), "bad names");
+
+            Roots = new List<string> { share }; Pin = "1234";
+            Server.Start(IPAddress.Loopback);
+            const string ip = "127.0.0.1";
+            Assert(Throws(() => Client.List(ip, "")) && !(Program.PinFor(ip) == Pin), "unknown password rejected");
+            try { Client.List(ip, ""); } catch (PinException) { RememberPin(ip, "1234", false); }
+            Client.List(ip, "");
+            Action<string, int> s = (x, y) => { };
+            var data = new byte[3000000]; new Random(1).NextBytes(data);
+            File.WriteAllBytes(Path.Combine(src, "sub", "big.bin"), data);
+            File.WriteAllText(Path.Combine(src, "a.txt"), "привет");
+
+            Client.Upload(ip, src, "", s);
+            Client.Upload(ip, Path.Combine(src, "a.txt"), "", s);
+            Client.Upload(ip, Path.Combine(src, "a.txt"), "", s);
+            Assert(File.Exists(Path.Combine(share, "a (1).txt")), "no overwrite");
+            Assert(File.ReadAllBytes(Path.Combine(share, "src", "sub", "big.bin")).SequenceEqual(data), "upload content");
+
+            var list = Client.List(ip, "");
+            Assert(list.Any(e => e.Name == "src" && e.IsDir) && list.Any(e => e.Name == "a.txt" && e.Size > 0), "list");
+
+            Client.Download(ip, "src", true, local, s);
+            Assert(File.ReadAllBytes(Path.Combine(local, "src", "sub", "big.bin")).SequenceEqual(data), "download content");
+
+            Client.Rename(ip, "a.txt", "b.txt");
+            Assert(File.Exists(Path.Combine(share, "b.txt")) && !File.Exists(Path.Combine(share, "a.txt")), "rename");
+            Assert(Throws(() => Client.Rename(ip, "b.txt", "..\\..\\x.txt")), "rename traversal");
+            Client.Rename(ip, "b.txt", "B.txt");
+            Assert(Directory.GetFiles(share, "b.txt").Select(Path.GetFileName).Single() == "B.txt", "rename case file");
+            Client.Rename(ip, "B.txt", "b.txt");
+            Client.Rename(ip, "src", "SRC");
+            Assert(Directory.GetDirectories(share, "src").Select(Path.GetFileName).Single() == "SRC", "rename case dir");
+            Client.Rename(ip, "SRC", "src");
+            Client.Delete(ip, "b.txt");
+            Assert(!File.Exists(Path.Combine(share, "b.txt")), "delete");
+
+            Assert(Throws(() => Client.List(ip, "..")), "remote traversal");
+            string putErr = "";
+            try { Client.SendFile(ip, Path.Combine(src, "a.txt"), "", s); } catch (IOException e) { putErr = e.Message; }
+            Assert(putErr == L.T("Empty file name", "Пустое имя файла"), "put error reaches client: " + putErr);
+            File.WriteAllText(Path.Combine(share, "c.txt.part"), "keep");
+            Client.SendFile(ip, Path.Combine(src, "a.txt"), "c.txt", s);
+            Assert(File.ReadAllText(Path.Combine(share, "c.txt.part")) == "keep", "existing .part kept");
+            Assert(Throws(() => Client.Delete(ip, "")), "delete root");
+            using (var raw = new TcpClient(ip, TcpPort))
+            {
+                var rw = new BinaryWriter(raw.GetStream(), Encoding.UTF8);
+                rw.Write("0000"); rw.Write("LIST"); rw.Write(""); rw.Flush();
+                Assert(!new BinaryReader(raw.GetStream(), Encoding.UTF8).ReadBoolean(), "wrong pin rejected");
+            }
+            string share2 = Path.Combine(tmp, "share2");
+            Directory.CreateDirectory(share2);
+            Roots = new List<string> { share, share2 };
+            var top = Client.List(ip, "");
+            Assert(top.Count == 2 && top[0].Name == "share" && top[1].Name == "share2" && top.All(e => e.IsDir), "virtual root");
+            Client.SendFile(ip, Path.Combine(src, "a.txt"), "share2\\x.txt", s);
+            Assert(File.Exists(Path.Combine(share2, "x.txt")), "upload into second share");
+            File.WriteAllText(Path.Combine(src, "inbox.txt"), "x");
+            Client.Upload(ip, Path.Combine(src, "inbox.txt"), "", s);
+            Assert(File.Exists(Path.Combine(share, "inbox.txt")), "top-level upload goes to inbox");
+            Assert(Throws(() => Client.List(ip, "share\\..\\share2")) && Throws(() => Client.List(ip, "share2\\..\\..")), "cross-share traversal");
+            Assert(Throws(() => Client.Delete(ip, "share2")) && Throws(() => Client.Rename(ip, "share2", "zz")), "share itself protected");
+            Assert(Throws(() => Client.Delete(ip, "")), "virtual root protected");
+            string nested = Path.Combine(share2, "inner");
+            Directory.CreateDirectory(nested);
+            Roots = new List<string> { share2, nested };
+            Assert(Throws(() => Client.Delete(ip, "share2\\inner")) && Throws(() => Client.Rename(ip, "share2\\inner", "q")), "nested share protected");
+            Assert(Directory.Exists(nested), "nested share kept");
+            Assert(Aliases(new List<string> { @"C:\a\Docs", @"D:\Docs", @"E:\" }).SequenceEqual(new[] { "Docs", "Docs (2)", "E" }), "aliases");
+            Assert(Updater.Parse("{\"tag_name\":\"v1.4.0\",\"html_url\":\"https://github.com/o/r/releases/tag/v1.4.0\"}", "1.3.0").Version == "1.4.0", "update newer");
+            Assert(Updater.Parse("{\"tag_name\":\"v1.3\",\"html_url\":\"x\"}", "1.3.0") == null, "update same");
+            string rel = "{\"tag_name\":\"v2.0.0\",\"html_url\":\"x\",\"assets\":[{\"name\":\"LanFiles.exe\",\"browser_download_url\":\"https://github.com/" + Updater.Repo + "/releases/download/v2.0.0/LanFiles.exe\"}]}";
+            Assert(Updater.Parse(rel, "1.3.0").Asset.EndsWith("/v2.0.0/LanFiles.exe"), "update asset");
+            Assert(Updater.Parse(rel.Replace("github.com/" + Updater.Repo, "evil.example/x"), "1.3.0").Asset == null, "update asset only from repo");
+            Assert(Updater.Parse("{\"tag_name\":\"1.2.9\",\"html_url\":\"x\"}", "1.3.0") == null, "update older");
+            Assert(CleanName(" a|b\tc ") == "abc" && CleanName(new string('x', 60)).Length == 40, "clean name");
+            File.WriteAllText(report, "OK");
+            return 0;
+        }
+        catch (Exception e) { File.WriteAllText(report, e.ToString()); return 1; }
+        finally { try { Directory.Delete(tmp, true); } catch (IOException) { } }
+    }
+
+    static void Assert(bool ok, string what) { if (!ok) throw new Exception("FAIL: " + what); }
+    static bool Throws(Action a) { try { a(); return false; } catch { return true; } }
+}
+
+static class Native
+{
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] static extern bool DestroyIcon(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool ShowScrollBar(IntPtr h, int bar, bool show);
+    [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int val, int size);
+    [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] public static extern int SetWindowTheme(IntPtr h, string app, string id);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    static extern int SHDefExtractIcon(string file, int index, uint flags, out IntPtr large, out IntPtr small, uint size);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr SHGetFileInfo(string path, uint attrs, ref SHFILEINFO info, uint size, uint flags);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern int SHFileOperation(ref SHFILEOPSTRUCT op);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct SHFILEINFO
+    {
+        public IntPtr hIcon; public int iIcon; public uint dwAttributes;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szDisplayName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)] public string szTypeName;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct SHFILEOPSTRUCT
+    {
+        public IntPtr hwnd; public uint wFunc; public string pFrom; public string pTo; public ushort fFlags;
+        public bool fAnyOperationsAborted; public IntPtr hNameMappings; public string lpszProgressTitle;
+    }
+
+    static int ColorRef(Color c) { return c.R | (c.G << 8) | (c.B << 16); }
+
+    public static void DarkTitle(IntPtr h)
+    {
+        int on = 1, cap = ColorRef(Theme.Bg), txt = ColorRef(Theme.Text);
+        DwmSetWindowAttribute(h, 20, ref on, 4);
+        DwmSetWindowAttribute(h, 35, ref cap, 4);
+        DwmSetWindowAttribute(h, 36, ref txt, 4);
+    }
+
+    public static void RoundCorners(IntPtr h) { int v = 2; DwmSetWindowAttribute(h, 33, ref v, 4); }
+
+    public static Icon ExeIcon(int size)
+    {
+        IntPtr l, s;
+        if (SHDefExtractIcon(Application.ExecutablePath, 0, 0, out l, out s, (uint)size) != 0 || l == IntPtr.Zero)
+            return SystemIcons.Application;
+        return Icon.FromHandle(l);
+    }
+
+    public static Bitmap TypeIcon(string name, bool dir, out string typeName)
+    {
+        var fi = new SHFILEINFO();
+        SHGetFileInfo(dir ? "folder" : name, dir ? 0x10u : 0x80u, ref fi, (uint)Marshal.SizeOf(fi), 0x100 | 0x1 | 0x10 | 0x400);
+        typeName = fi.szTypeName ?? "";
+        if (fi.hIcon == IntPtr.Zero) return null;
+        var bmp = Icon.FromHandle(fi.hIcon).ToBitmap();
+        DestroyIcon(fi.hIcon);
+        return bmp;
+    }
+
+    public static void ToRecycleBin(string path)
+    {
+        var op = new SHFILEOPSTRUCT { wFunc = 3, pFrom = path + "\0\0", fFlags = 0x4 | 0x10 | 0x40 | 0x400 | 0x4000 };
+        int r = SHFileOperation(ref op);
+        if (r != 0 || op.fAnyOperationsAborted) throw new IOException(L.T("Could not delete (code ", "Не удалось удалить (код ") + r + ")");
+    }
+}
+
+static class FolderPicker
+{
+    [ComImport, Guid("DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7")] class FileOpenDialog { }
+
+    [ComImport, Guid("42f85136-db7e-439c-85f1-e4075d135fc8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IFileDialog
+    {
+        [PreserveSig] int Show(IntPtr owner);
+        void SetFileTypes(uint n, IntPtr spec);
+        void SetFileTypeIndex(uint i);
+        void GetFileTypeIndex(out uint i);
+        void Advise(IntPtr sink, out uint cookie);
+        void Unadvise(uint cookie);
+        void SetOptions(uint fos);
+        void GetOptions(out uint fos);
+        void SetDefaultFolder(IShellItem si);
+        void SetFolder(IShellItem si);
+        void GetFolder(out IShellItem si);
+        void GetCurrentSelection(out IShellItem si);
+        void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string name);
+        void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string name);
+        void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string title);
+        void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string text);
+        void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string label);
+        void GetResult(out IShellItem si);
+    }
+
+    [ComImport, Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IShellItem
+    {
+        void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+        void GetParent(out IShellItem si);
+        void GetDisplayName(uint sigdn, [MarshalAs(UnmanagedType.LPWStr)] out string name);
+        void GetAttributes(uint mask, out uint attrs);
+        void Compare(IShellItem si, uint hint, out int order);
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    static extern int SHCreateItemFromParsingName(string path, IntPtr pbc, ref Guid riid, out IShellItem item);
+
+    public static string Pick(IWin32Window owner, string title, string initial)
+    {
+        var d = (IFileDialog)new FileOpenDialog();
+        try
+        {
+            uint o; d.GetOptions(out o);
+            d.SetOptions(o | 0x20 | 0x40);
+            d.SetTitle(title);
+            if (initial != null && Directory.Exists(initial))
+            {
+                IShellItem it; Guid g = typeof(IShellItem).GUID;
+                if (SHCreateItemFromParsingName(initial, IntPtr.Zero, ref g, out it) == 0) d.SetFolder(it);
+            }
+            if (d.Show(owner == null ? IntPtr.Zero : owner.Handle) != 0) return null;
+            IShellItem res; d.GetResult(out res);
+            string path; res.GetDisplayName(0x80058000, out path);
+            return path;
+        }
+        finally { Marshal.ReleaseComObject(d); }
+    }
+}
+
+static class Ipc
+{
+    static string PipeName { get { return "LanFiles_" + WindowsIdentity.GetCurrent().User.Value + "_" + Process.GetCurrentProcess().SessionId; } }
+
+    public static bool Post(params string[] lines) { return TryWrite(lines, 1000); }
+
+    static bool TryWrite(IEnumerable<string> lines, int timeout)
+    {
+        try
+        {
+            using (var p = new NamedPipeClientStream(".", PipeName, PipeDirection.Out))
+            {
+                p.Connect(timeout);
+                var w = new StreamWriter(p, new UTF8Encoding(false));
+                foreach (var l in lines) w.WriteLine(l);
+                w.Flush();
+            }
+            return true;
+        }
+        catch (TimeoutException) { return false; }
+        catch (IOException) { return false; }
+    }
+
+    public static bool SendToInstance(string ip, IEnumerable<string> paths)
+    {
+        List<string> lines;
+        try { lines = paths.Select(p => "SEND\t" + ip + "\t" + Path.GetFullPath(p)).ToList(); }
+        catch (Exception ex)
+        {
+            MessageBox.Show(L.T("This item cannot be sent: ", "Этот объект нельзя отправить: ") + ex.Message, "LanFiles", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+        if (TryWrite(lines, 500)) return true;
+        Process.Start(Application.ExecutablePath, "--tray");
+        for (int i = 0; i < 30; i++) if (TryWrite(lines, 1000)) return true;
+        MessageBox.Show(L.T("Could not start LanFiles to send.", "Не удалось запустить LanFiles для отправки."), "LanFiles", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        return false;
+    }
+
+    public static void StartServer(Action<string> onLine)
+    {
+        new Thread(() =>
+        {
+            while (true)
+            {
+                try
+                {
+                    var ps = new PipeSecurity();
+                    ps.AddAccessRule(new PipeAccessRule(WindowsIdentity.GetCurrent().User, PipeAccessRights.ReadWrite, AccessControlType.Allow));
+                    using (var p = new NamedPipeServerStream(PipeName, PipeDirection.In, 1, PipeTransmissionMode.Byte, PipeOptions.None, 0, 0, ps))
+                    {
+                        p.WaitForConnection();
+                        var r = new StreamReader(p, Encoding.UTF8);
+                        string line;
+                        while ((line = r.ReadLine()) != null) onLine(line);
+                    }
+                }
+                catch (IOException) { Thread.Sleep(200); }
+                catch (Exception) { Thread.Sleep(2000); }
+            }
+        }) { IsBackground = true }.Start();
+    }
+}
+
+static class Server
+{
+    static readonly object failLock = new object();
+
+    public static void Start(IPAddress bind)
+    {
+        var l = new TcpListener(bind, Program.TcpPort);
+        l.Start();
+        new Thread(() =>
+        {
+            while (true)
+            {
+                TcpClient c;
+                try { c = l.AcceptTcpClient(); } catch (SocketException) { continue; }
+                ThreadPool.QueueUserWorkItem(_ => Handle(c));
+            }
+        }) { IsBackground = true }.Start();
+    }
+
+    static void Handle(TcpClient c)
+    {
+        using (c)
+        {
+            c.ReceiveTimeout = c.SendTimeout = 60000;
+            var s = c.GetStream();
+            var r = new BinaryReader(s, Encoding.UTF8);
+            var w = new BinaryWriter(s, Encoding.UTF8);
+            try
+            {
+                string pin = r.ReadString(), cmd = r.ReadString(), rel = r.ReadString();
+                long len = cmd == "PUT" ? r.ReadInt64() : 0;
+                string newName = cmd == "REN" ? r.ReadString() : null;
+                if (pin != Program.Pin)
+                {
+                    lock (failLock) Thread.Sleep(1000);
+                    throw new UnauthorizedAccessException(Program.BadPin);
+                }
+                var roots = Program.Roots;
+                string root, p = Program.Resolve(roots, rel, out root);
+                if (root == null)
+                {
+                    if (cmd != "LIST") throw new IOException(L.T("Open one of the shared folders first", "Сначала откройте одну из общих папок"));
+                    var al = Program.Aliases(roots);
+                    var live = Enumerable.Range(0, roots.Count).Where(i => Directory.Exists(roots[i])).ToList();
+                    w.Write(true); w.Write(live.Count);
+                    foreach (int i in live) { w.Write(al[i]); w.Write(true); w.Write(0L); }
+                }
+                else if (cmd == "LIST")
+                {
+                    var di = new DirectoryInfo(p);
+                    var dirs = di.GetDirectories(); var files = di.GetFiles();
+                    w.Write(true); w.Write(dirs.Length + files.Length);
+                    foreach (var d in dirs) { w.Write(d.Name); w.Write(true); w.Write(0L); }
+                    foreach (var f in files) { w.Write(f.Name); w.Write(false); w.Write(f.Length); }
+                }
+                else if (cmd == "GET")
+                {
+                    using (var f = File.OpenRead(p)) { w.Write(true); w.Write(f.Length); w.Flush(); f.CopyTo(s); }
+                }
+                else if (cmd == "PUT")
+                {
+                    if (Program.IsRoot(root, p)) throw new IOException(L.T("Empty file name", "Пустое имя файла"));
+                    Directory.CreateDirectory(Path.GetDirectoryName(p));
+                    if (new DriveInfo(Path.GetPathRoot(p)).AvailableFreeSpace < len) throw new IOException(L.T("Not enough disk space", "Недостаточно места на диске"));
+                    w.Write(true); w.Flush();
+                    Interlocked.Increment(ref Program.Receiving);
+                    string saved;
+                    try { saved = Program.ReceiveFile(s, len, p, null); }
+                    finally { Interlocked.Decrement(ref Program.Receiving); }
+                    w.Write(true);
+                    string inside = Path.GetFullPath(saved).Substring(Path.GetFullPath(root).TrimEnd('\\').Length + 1);
+                    int cut = inside.IndexOf('\\');
+                    Program.OnReceived(((IPEndPoint)c.Client.RemoteEndPoint).Address.ToString(),
+                        Path.Combine(root, cut < 0 ? inside : inside.Substring(0, cut)));
+                }
+                else if (cmd == "DEL")
+                {
+                    if (Program.HoldsRoot(roots, p)) throw new IOException(L.T("The shared folder cannot be deleted", "Нельзя удалить общую папку"));
+                    if (!File.Exists(p) && !Directory.Exists(p)) throw new FileNotFoundException(L.T("Not found: ", "Не найдено: ") + rel);
+                    Native.ToRecycleBin(p);
+                    w.Write(true);
+                }
+                else if (cmd == "REN")
+                {
+                    Program.CheckName(newName);
+                    if (Program.HoldsRoot(roots, p)) throw new IOException(L.T("The shared folder cannot be renamed", "Нельзя переименовать общую папку"));
+                    string target = Path.Combine(Path.GetDirectoryName(p), newName);
+                    bool caseOnly = string.Equals(target, p, StringComparison.OrdinalIgnoreCase);
+                    if (!caseOnly && (File.Exists(target) || Directory.Exists(target))) throw new IOException(L.T("This name already exists", "Такое имя уже есть"));
+                    if (!Directory.Exists(p)) File.Move(p, target);
+                    else if (!caseOnly) Directory.Move(p, target);
+                    else { string t = Program.UniquePath(p + ".ren"); Directory.Move(p, t); Directory.Move(t, target); }
+                    w.Write(true);
+                }
+                else throw new InvalidOperationException(L.T("Unknown command", "Неизвестная команда"));
+                w.Flush();
+            }
+            catch (Exception e)
+            {
+                try { w.Write(false); w.Write(e.Message); w.Flush(); } catch (IOException) { } catch (ObjectDisposedException) { }
+            }
+        }
+    }
+}
+
+class Entry { public string Name; public bool IsDir; public long Size; }
+
+class PinException : IOException { public PinException() : base(L.T("Wrong computer password", "Неверный пароль компьютера")) { } }
+
+class Conn : IDisposable
+{
+    public TcpClient C; public NetworkStream S; public BinaryReader R; public BinaryWriter W;
+
+    public Conn(string ip, string cmd, string rel)
+    {
+        C = new TcpClient();
+        var ar = C.BeginConnect(ip, Program.TcpPort, null, null);
+        if (!ar.AsyncWaitHandle.WaitOne(5000)) { C.Close(); throw new IOException(L.T("Computer ", "Компьютер ") + ip + L.T(" is not responding", " не отвечает")); }
+        C.EndConnect(ar);
+        C.ReceiveTimeout = C.SendTimeout = 60000;
+        S = C.GetStream();
+        R = new BinaryReader(S, Encoding.UTF8); W = new BinaryWriter(S, Encoding.UTF8);
+        W.Write(Program.PinFor(ip)); W.Write(cmd); W.Write(rel);
+    }
+
+    public void CheckOk()
+    {
+        W.Flush();
+        if (R.ReadBoolean()) return;
+        string msg = R.ReadString();
+        throw msg == Program.BadPin ? new PinException() : new IOException(msg);
+    }
+    public void Dispose() { C.Close(); }
+}
+
+static class Client
+{
+    public static string Join(string a, string b) { return a == "" ? b : a + "\\" + b; }
+
+    static Action<long> Progress(Action<string, int> status, string what, long total)
+    {
+        status(what, 0);
+        return done => status(what, total == 0 ? 100 : (int)(done * 100 / total));
+    }
+
+    public static List<Entry> List(string ip, string rel)
+    {
+        using (var c = new Conn(ip, "LIST", rel))
+        {
+            c.CheckOk();
+            int n = c.R.ReadInt32();
+            var res = new List<Entry>();
+            for (int i = 0; i < n; i++)
+                res.Add(new Entry { Name = c.R.ReadString(), IsDir = c.R.ReadBoolean(), Size = c.R.ReadInt64() });
+            return res;
+        }
+    }
+
+    public static void Download(string ip, string rel, bool isDir, string localDir, Action<string, int> status)
+    {
+        string name = Path.GetFileName(rel);
+        Program.CheckName(name);
+        if (isDir)
+        {
+            var items = List(ip, rel);
+            string d = Program.UniquePath(Path.Combine(localDir, name));
+            Directory.CreateDirectory(d);
+            foreach (var e in items) Download(ip, Join(rel, e.Name), e.IsDir, d, status);
+            return;
+        }
+        using (var c = new Conn(ip, "GET", rel))
+        {
+            c.CheckOk();
+            long len = c.R.ReadInt64();
+            Program.ReceiveFile(c.S, len, Path.Combine(localDir, name), Progress(status, L.T("Downloading: ", "Скачивание: ") + name, len));
+        }
+    }
+
+    public static void Upload(string ip, string localPath, string remoteDir, Action<string, int> status)
+    {
+        if (remoteDir == "") remoteDir = "*";
+        string trimmed = localPath.TrimEnd('\\');
+        string name = Path.GetFileName(trimmed);
+        if (Directory.Exists(localPath))
+        {
+            foreach (var f in Directory.GetFiles(localPath, "*", SearchOption.AllDirectories))
+                SendFile(ip, f, Join(remoteDir, name + f.Substring(trimmed.Length)), status);
+        }
+        else SendFile(ip, localPath, Join(remoteDir, name), status);
+    }
+
+    public static void SendFile(string ip, string local, string rel, Action<string, int> status)
+    {
+        using (var f = File.OpenRead(local))
+        using (var c = new Conn(ip, "PUT", rel))
+        {
+            c.W.Write(f.Length);
+            c.CheckOk();
+            Program.Copy(f, c.S, f.Length, Progress(status, L.T("Sending: ", "Отправка: ") + Path.GetFileName(local), f.Length));
+            c.CheckOk();
+        }
+    }
+
+    public static void Delete(string ip, string rel)
+    {
+        using (var c = new Conn(ip, "DEL", rel)) c.CheckOk();
+    }
+
+    public static void Rename(string ip, string rel, string newName)
+    {
+        using (var c = new Conn(ip, "REN", rel)) { c.W.Write(newName); c.CheckOk(); }
+    }
+}
+
+static class Discovery
+{
+    static readonly string myId = Guid.NewGuid().ToString("N");
+    static UdpClient udp;
+    public static event Action<string, string> Found;
+
+    public static void Start()
+    {
+        udp = new UdpClient();
+        udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        udp.Client.Bind(new IPEndPoint(IPAddress.Any, Program.UdpPort));
+        udp.EnableBroadcast = true;
+        new Thread(Listen) { IsBackground = true }.Start();
+        new Thread(() => { while (true) { Send("?", null); Thread.Sleep(5000); } }) { IsBackground = true }.Start();
+    }
+
+    static void Send(string kind, IPEndPoint to)
+    {
+        var msg = Encoding.UTF8.GetBytes("LANFILES|" + myId + "|" + Program.MyName + "|" + kind);
+        var targets = new List<IPEndPoint>();
+        if (to != null) targets.Add(to);
+        else
+        {
+            targets.Add(new IPEndPoint(IPAddress.Broadcast, Program.UdpPort));
+            foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                foreach (var ua in ni.GetIPProperties().UnicastAddresses)
+                {
+                    if (ua.Address.AddressFamily != AddressFamily.InterNetwork || ua.IPv4Mask == null) continue;
+                    var a = ua.Address.GetAddressBytes(); var m = ua.IPv4Mask.GetAddressBytes();
+                    for (int i = 0; i < 4; i++) a[i] = (byte)(a[i] | ~m[i]);
+                    targets.Add(new IPEndPoint(new IPAddress(a), Program.UdpPort));
+                }
+            }
+        }
+        foreach (var t in targets) { try { udp.Send(msg, msg.Length, t); } catch (SocketException) { } }
+    }
+
+    static void Listen()
+    {
+        while (true)
+        {
+            var ep = new IPEndPoint(IPAddress.Any, 0);
+            byte[] b;
+            try { b = udp.Receive(ref ep); } catch (SocketException) { continue; }
+            var p = Encoding.UTF8.GetString(b).Split('|');
+            if (p.Length != 4 || p[0] != "LANFILES" || p[1] == myId) continue;
+            if (p[3] == "?") Send("!", new IPEndPoint(ep.Address, Program.UdpPort));
+            string name = Program.CleanName(p[2]);
+            var h = Found; if (h != null) h(ep.Address.ToString(), name == "" ? ep.Address.ToString() : name);
+        }
+    }
+}
+
+static class Theme
+{
+    public static readonly Color Bg = Color.FromArgb(32, 32, 32), Layer = Color.FromArgb(43, 43, 43),
+        LayerHover = Color.FromArgb(50, 50, 50), LayerPressed = Color.FromArgb(38, 38, 38),
+        Stroke = Color.FromArgb(58, 58, 58), Text = Color.White, TextSecondary = Color.FromArgb(206, 206, 206),
+        TextTertiary = Color.FromArgb(140, 140, 140), Input = Color.FromArgb(50, 50, 50), InputFocus = Color.FromArgb(30, 30, 30),
+        MenuBg = Color.FromArgb(44, 44, 44), MenuHover = Color.FromArgb(58, 58, 58);
+    public static Color Accent, OnAccent;
+    public static float Scale = 1;
+    public static Font Body, Small, Strong, Subtitle, Title, Mono;
+    public static readonly Color Online = Color.FromArgb(108, 203, 95);
+    static string iconFamily;
+    static readonly Dictionary<int, Font> iconFonts = new Dictionary<int, Font>();
+
+    public static int S(int px) { return (int)Math.Round(px * Scale); }
+
+    public static void Init()
+    {
+        using (var g = Graphics.FromHwnd(IntPtr.Zero)) Scale = g.DpiX / 96f;
+        var fams = new HashSet<string>(FontFamily.Families.Select(f => f.Name));
+        iconFamily = fams.Contains("Segoe Fluent Icons") ? "Segoe Fluent Icons" : "Segoe MDL2 Assets";
+        Body = new Font("Segoe UI", 10f);
+        Small = new Font("Segoe UI", 9f);
+        Strong = new Font("Segoe UI Semibold", 10.5f);
+        Subtitle = new Font("Segoe UI Semibold", 14f);
+        Title = new Font("Segoe UI Semibold", 20f);
+        Mono = new Font(fams.Contains("Cascadia Mono") ? "Cascadia Mono" : "Consolas", 9f);
+        Accent = ReadAccent();
+        OnAccent = Accent.R * 0.299 + Accent.G * 0.587 + Accent.B * 0.114 > 140 ? Color.Black : Color.White;
+    }
+
+    static Color ReadAccent()
+    {
+        try
+        {
+            using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent"))
+            {
+                var p = k == null ? null : k.GetValue("AccentPalette") as byte[];
+                if (p != null && p.Length >= 8) return Color.FromArgb(p[4], p[5], p[6]);
+            }
+        }
+        catch (System.Security.SecurityException) { }
+        return Color.FromArgb(76, 194, 255);
+    }
+
+    public static Font IconFont(int px)
+    {
+        Font f;
+        if (!iconFonts.TryGetValue(px, out f)) iconFonts[px] = f = new Font(iconFamily, px, GraphicsUnit.Pixel);
+        return f;
+    }
+
+    public static void DrawGlyph(Graphics g, char c, Rectangle r, Color col, int px)
+    {
+        TextRenderer.DrawText(g, c.ToString(), IconFont(px), r, col,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+    }
+
+    public static Bitmap GlyphBitmap(char c, int px, Color col)
+    {
+        var b = new Bitmap(px, px);
+        using (var g = Graphics.FromImage(b))
+        using (var br = new SolidBrush(col))
+        using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+        {
+            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+            g.DrawString(c.ToString(), IconFont(px), br, new RectangleF(0, 0, px, px), sf);
+        }
+        return b;
+    }
+
+    public static GraphicsPath Round(Rectangle r, int radius)
+    {
+        var p = new GraphicsPath();
+        int d = Math.Max(1, radius * 2);
+        p.AddArc(r.X, r.Y, d, d, 180, 90);
+        p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        p.CloseFigure();
+        return p;
+    }
+
+    public static void Apply(Form f)
+    {
+        f.BackColor = Bg; f.ForeColor = Text; f.Font = Body;
+        f.AutoScaleMode = AutoScaleMode.None;
+        f.HandleCreated += (s, e) => Native.DarkTitle(f.Handle);
+    }
+
+    public static Color ParentBack(Control c) { return c.Parent != null ? c.Parent.BackColor : Bg; }
+
+    public static ToolTip MakeTip()
+    {
+        var t = new ToolTip { OwnerDraw = true, InitialDelay = 400 };
+        t.Popup += (s, e) =>
+        {
+            var sz = TextRenderer.MeasureText(t.GetToolTip(e.AssociatedControl), Small);
+            e.ToolTipSize = new Size(sz.Width + S(16), sz.Height + S(10));
+        };
+        t.Draw += (s, e) =>
+        {
+            using (var b = new SolidBrush(MenuBg)) e.Graphics.FillRectangle(b, e.Bounds);
+            using (var p = new Pen(Stroke)) e.Graphics.DrawRectangle(p, 0, 0, e.Bounds.Width - 1, e.Bounds.Height - 1);
+            TextRenderer.DrawText(e.Graphics, e.ToolTipText, Small, e.Bounds, Text,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        };
+        return t;
+    }
+}
+
+static class Menus
+{
+    public static ContextMenuStrip Create()
+    {
+        var m = new ContextMenuStrip
+        {
+            Renderer = new DarkRenderer(), Font = Theme.Body, BackColor = Theme.MenuBg, ForeColor = Theme.Text,
+            ImageScalingSize = new Size(Theme.S(16), Theme.S(16)), Padding = new Padding(Theme.S(2), Theme.S(4), Theme.S(2), Theme.S(4))
+        };
+        m.Opened += (s, e) => Native.RoundCorners(m.Handle);
+        return m;
+    }
+
+    public static ToolStripMenuItem Item(ContextMenuStrip m, string text, char glyph, string keys, EventHandler click)
+    {
+        var i = new ToolStripMenuItem(text, glyph == '\0' ? null : Theme.GlyphBitmap(glyph, Theme.S(16), Theme.Text), click)
+        {
+            ShortcutKeyDisplayString = keys, Padding = new Padding(Theme.S(4), Theme.S(5), Theme.S(4), Theme.S(5))
+        };
+        m.Items.Add(i);
+        return i;
+    }
+}
+
+class DarkRenderer : ToolStripProfessionalRenderer
+{
+    public DarkRenderer() { RoundedEdges = false; }
+
+    protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
+    {
+        using (var b = new SolidBrush(Theme.MenuBg)) e.Graphics.FillRectangle(b, e.AffectedBounds);
+    }
+
+    protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
+    {
+        using (var p = new Pen(Theme.Stroke)) e.Graphics.DrawRectangle(p, 0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1);
+    }
+
+    protected override void OnRenderImageMargin(ToolStripRenderEventArgs e) { }
+
+    protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+    {
+        if (!e.Item.Selected || !e.Item.Enabled) return;
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        var r = new Rectangle(Theme.S(3), 0, e.Item.Width - Theme.S(6), e.Item.Height - 1);
+        using (var path = Theme.Round(r, Theme.S(4))) using (var b = new SolidBrush(Theme.MenuHover)) e.Graphics.FillPath(b, path);
+    }
+
+    protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+    {
+        var mi = e.Item as ToolStripMenuItem;
+        bool shortcut = mi != null && e.Text == mi.ShortcutKeyDisplayString;
+        e.TextColor = !e.Item.Enabled ? Theme.TextTertiary : shortcut ? Theme.TextTertiary : Theme.Text;
+        base.OnRenderItemText(e);
+    }
+
+    protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
+    {
+        int y = e.Item.Height / 2;
+        using (var p = new Pen(Theme.Stroke)) e.Graphics.DrawLine(p, Theme.S(4), y, e.Item.Width - Theme.S(4), y);
+    }
+
+    protected override void OnRenderArrow(ToolStripArrowRenderEventArgs e) { e.ArrowColor = Theme.Text; base.OnRenderArrow(e); }
+}
+
+class FluentButton : Button
+{
+    public enum Kind { Standard, Accent, Subtle }
+    readonly Kind kind;
+    readonly char glyph;
+    bool hover, down;
+
+    public FluentButton(string text, char glyph = '\0', Kind kind = Kind.Standard)
+    {
+        this.kind = kind; this.glyph = glyph;
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        Font = Theme.Body; Text = text;
+        Margin = new Padding(Theme.S(2));
+        Size = Measure();
+    }
+
+    Size Measure()
+    {
+        int w = Theme.S(11) * 2;
+        if (Text != "") w += TextRenderer.MeasureText(Text, Font).Width;
+        if (glyph != '\0') w += Theme.S(16) + (Text != "" ? Theme.S(8) : 0);
+        if (Text == "") w = Theme.S(36);
+        return new Size(w, Theme.S(32));
+    }
+
+    protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { hover = down = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnMouseDown(MouseEventArgs e) { down = true; Invalidate(); base.OnMouseDown(e); }
+    protected override void OnMouseUp(MouseEventArgs e) { down = false; Invalidate(); base.OnMouseUp(e); }
+    protected override void OnEnabledChanged(EventArgs e) { Invalidate(); base.OnEnabledChanged(e); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.Clear(Theme.ParentBack(this));
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        var r = new Rectangle(0, 0, Width - 1, Height - 1);
+        Color bg, fg = Enabled ? Theme.Text : Theme.TextTertiary;
+        if (kind == Kind.Accent)
+        {
+            bg = !Enabled ? Theme.Stroke : down ? ControlPaint.Dark(Theme.Accent, 0.1f) : hover ? ControlPaint.Light(Theme.Accent, 0.15f) : Theme.Accent;
+            if (Enabled) fg = Theme.OnAccent;
+        }
+        else if (kind == Kind.Subtle)
+            bg = !Enabled ? Color.Empty : down ? Theme.LayerPressed : hover ? Theme.LayerHover : Color.Empty;
+        else
+            bg = down ? Theme.LayerPressed : hover && Enabled ? Theme.LayerHover : Color.FromArgb(45, 45, 45);
+
+        using (var path = Theme.Round(r, Theme.S(4)))
+        {
+            if (bg != Color.Empty) using (var b = new SolidBrush(bg)) g.FillPath(b, path);
+            if (kind == Kind.Standard) using (var p = new Pen(Theme.Stroke)) g.DrawPath(p, path);
+            if (Focused && ShowFocusCues)
+                using (var p = new Pen(Theme.Text, Theme.S(2))) using (var fp = Theme.Round(Rectangle.Inflate(r, -1, -1), Theme.S(4))) g.DrawPath(p, fp);
+        }
+
+        int textW = Text == "" ? 0 : TextRenderer.MeasureText(Text, Font).Width;
+        int glyphW = glyph == '\0' ? 0 : Theme.S(16);
+        int gap = glyphW > 0 && textW > 0 ? Theme.S(8) : 0;
+        int x = (Width - textW - glyphW - gap) / 2;
+        if (glyphW > 0)
+        {
+            Theme.DrawGlyph(g, glyph, new Rectangle(x, 0, glyphW, Height), fg, Theme.S(16));
+            x += glyphW + gap;
+        }
+        if (textW > 0)
+            TextRenderer.DrawText(g, Text, Font, new Rectangle(x, 0, textW + 2, Height), fg, TextFormatFlags.VerticalCenter | TextFormatFlags.Left);
+    }
+}
+
+class Toggle : CheckBox
+{
+    bool hover;
+
+    public Toggle()
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        AutoSize = false; Size = new Size(Theme.S(100), Theme.S(28)); Cursor = Cursors.Hand;
+    }
+
+    protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.Clear(Theme.ParentBack(this));
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        var pill = new Rectangle(Width - Theme.S(40) - 2, (Height - Theme.S(20)) / 2, Theme.S(40), Theme.S(20));
+        TextRenderer.DrawText(g, Checked ? L.T("On", "Вкл.") : L.T("Off", "Откл."), Theme.Body, new Rectangle(0, 0, pill.Left - Theme.S(10), Height),
+            Theme.Text, TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
+        int knob = hover ? Theme.S(14) : Theme.S(12);
+        using (var path = Theme.Round(pill, pill.Height / 2))
+        {
+            if (Checked)
+            {
+                using (var b = new SolidBrush(hover ? ControlPaint.Light(Theme.Accent, 0.15f) : Theme.Accent)) g.FillPath(b, path);
+                using (var b = new SolidBrush(Theme.OnAccent))
+                    g.FillEllipse(b, pill.Right - Theme.S(10) - knob / 2, pill.Top + (pill.Height - knob) / 2, knob, knob);
+            }
+            else
+            {
+                using (var b = new SolidBrush(Color.FromArgb(hover ? 40 : 30, 255, 255, 255))) g.FillPath(b, path);
+                using (var p = new Pen(Theme.TextSecondary)) g.DrawPath(p, path);
+                using (var b = new SolidBrush(Theme.TextSecondary))
+                    g.FillEllipse(b, pill.Left + Theme.S(10) - knob / 2, pill.Top + (pill.Height - knob) / 2, knob, knob);
+            }
+        }
+        if (Focused && ShowFocusCues)
+            using (var p = new Pen(Theme.Text, Theme.S(2))) using (var fp = Theme.Round(Rectangle.Inflate(pill, Theme.S(3), Theme.S(3)), pill.Height / 2 + Theme.S(3))) g.DrawPath(p, fp);
+    }
+}
+
+class FluentTextBox : Panel
+{
+    public readonly TextBox Box;
+
+    public FluentTextBox(int width)
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        Size = new Size(width, Theme.S(34));
+        Box = new TextBox { BorderStyle = BorderStyle.None, BackColor = Theme.Input, ForeColor = Theme.Text, Font = Theme.Body };
+        Box.Location = new Point(Theme.S(10), (Height - Box.PreferredHeight) / 2 + 1);
+        Box.Width = width - Theme.S(20);
+        Box.GotFocus += (s, e) => { Box.BackColor = Theme.InputFocus; Invalidate(); };
+        Box.LostFocus += (s, e) => { Box.BackColor = Theme.Input; Invalidate(); };
+        Controls.Add(Box);
+        Cursor = Cursors.IBeam;
+    }
+
+    public string Value { get { return Box.Text; } set { Box.Text = value; } }
+
+    protected override void OnClick(EventArgs e) { Box.Focus(); base.OnClick(e); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.Clear(Theme.ParentBack(this));
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        bool f = Box.Focused;
+        var r = new Rectangle(0, 0, Width - 1, Height - 1);
+        using (var path = Theme.Round(r, Theme.S(4)))
+        {
+            using (var b = new SolidBrush(f ? Theme.InputFocus : Theme.Input)) g.FillPath(b, path);
+            using (var p = new Pen(Theme.Stroke)) g.DrawPath(p, path);
+        }
+        g.SmoothingMode = SmoothingMode.None;
+        int h = f ? Theme.S(2) : 1;
+        using (var b = new SolidBrush(f ? Theme.Accent : Theme.TextTertiary))
+            g.FillRectangle(b, Theme.S(3), Height - h, Width - Theme.S(6), h);
+    }
+}
+
+class RoundPanel : Panel
+{
+    public char Glyph;
+
+    public RoundPanel()
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        BackColor = Theme.Layer;
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.Clear(Theme.ParentBack(this));
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (var path = Theme.Round(new Rectangle(0, 0, Width - 1, Height - 1), Theme.S(6)))
+        {
+            using (var b = new SolidBrush(Theme.Layer)) g.FillPath(b, path);
+            using (var p = new Pen(Color.FromArgb(29, 29, 29))) g.DrawPath(p, path);
+        }
+        if (Glyph != '\0') Theme.DrawGlyph(g, Glyph, new Rectangle(Theme.S(16), 0, Theme.S(24), Height), Theme.Text, Theme.S(20));
+    }
+}
+
+class PcCard : Button
+{
+    public string Title, Sub;
+    public bool DropHighlight, Local, MonoSub;
+    public static Rectangle CollapseBox { get { return new Rectangle(Theme.S(196) - Theme.S(40), Theme.S(4), Theme.S(36), Theme.S(36)); } }
+    bool collapsed;
+    public bool Collapsed
+    {
+        get { return collapsed; }
+        set { collapsed = value; Size = value ? new Size(Theme.S(56), Theme.S(56)) : new Size(Theme.S(196), Theme.S(172)); Invalidate(); }
+    }
+    public int Status;
+    bool hover, down;
+
+    public PcCard(string title, string sub)
+    {
+        Title = title; Sub = sub; Text = title + ", " + sub;
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        Size = new Size(Theme.S(196), Theme.S(172)); Margin = new Padding(Theme.S(6)); Cursor = Cursors.Hand;
+    }
+
+    protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { hover = down = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnMouseDown(MouseEventArgs e) { down = true; Invalidate(); base.OnMouseDown(e); }
+    protected override void OnMouseUp(MouseEventArgs e) { down = false; Invalidate(); base.OnMouseUp(e); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.Clear(Theme.ParentBack(this));
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        var r = new Rectangle(0, 0, Width - 1, Height - 1);
+        var bg = !Enabled ? Color.FromArgb(38, 38, 38) : down ? Theme.LayerPressed : hover || DropHighlight ? Theme.LayerHover : Theme.Layer;
+        using (var path = Theme.Round(r, Theme.S(8)))
+        {
+            using (var b = new SolidBrush(bg)) g.FillPath(b, path);
+            using (var p = new Pen(DropHighlight ? Theme.Text : Color.FromArgb(55, 55, 55), DropHighlight ? Theme.S(2) : 1)) g.DrawPath(p, path);
+            if (Focused && ShowFocusCues)
+                using (var p = new Pen(Theme.Text, Theme.S(2))) using (var fp = Theme.Round(Rectangle.Inflate(r, -1, -1), Theme.S(8))) g.DrawPath(p, fp);
+        }
+        if (collapsed) { Theme.DrawGlyph(g, '\uE80F', new Rectangle(0, 0, Width, Height), Theme.TextSecondary, Theme.S(24)); return; }
+        if (Local) Theme.DrawGlyph(g, '\uE70E', CollapseBox, Theme.TextTertiary, Theme.S(12));
+        Theme.DrawGlyph(g, Local ? '\uE80F' : '\uE977', new Rectangle(0, Theme.S(20), Width, Theme.S(60)), Enabled ? Theme.TextSecondary : Theme.TextTertiary, Theme.S(48));
+        TextRenderer.DrawText(g, Title, Theme.Strong, new Rectangle(Theme.S(12), Theme.S(92), Width - Theme.S(24), Theme.S(24)),
+            Enabled ? Theme.Text : Theme.TextSecondary, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+        var font = MonoSub ? Theme.Mono : Theme.Small;
+        if (Status == 0)
+        {
+            TextRenderer.DrawText(g, Sub, font, new Rectangle(Theme.S(12), Theme.S(120), Width - Theme.S(24), Theme.S(40)),
+                Theme.TextSecondary, TextFormatFlags.HorizontalCenter | TextFormatFlags.Top | TextFormatFlags.WordBreak | TextFormatFlags.EndEllipsis);
+            return;
+        }
+        int dot = Theme.S(8), gap = Theme.S(8), maxW = Width - Theme.S(24) - dot - gap;
+        int tw = Math.Min(maxW, TextRenderer.MeasureText(g, Sub, font, Size.Empty, TextFormatFlags.NoPadding).Width);
+        int x = (Width - dot - gap - tw) / 2, y = Theme.S(124);
+        using (var b = new SolidBrush(Status == 1 ? Theme.Online : Theme.TextTertiary)) g.FillEllipse(b, x, y + Theme.S(4), dot, dot);
+        TextRenderer.DrawText(g, Sub, font, new Rectangle(x + dot + gap, y, tw + Theme.S(2), Theme.S(16)), Theme.TextSecondary,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
+    }
+}
+
+class EmptyState : Control
+{
+    public EmptyState()
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.Clear(BackColor);
+        int cy = Height / 2 - Theme.S(40);
+        Theme.DrawGlyph(g, '\uE8B7', new Rectangle(0, cy, Width, Theme.S(48)), Theme.TextTertiary, Theme.S(40));
+        TextRenderer.DrawText(g, L.T("This folder is empty", "Папка пуста"), Theme.Strong, new Rectangle(0, cy + Theme.S(56), Width, Theme.S(24)),
+            Theme.Text, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        TextRenderer.DrawText(g, L.T("Drop files here to send them", "Перетащите сюда файлы, чтобы отправить"), Theme.Small, new Rectangle(0, cy + Theme.S(80), Width, Theme.S(20)),
+            Theme.TextSecondary, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+    }
+}
+
+class ProgressLine : Control
+{
+    int value = -1;
+    public int Value { get { return value; } set { this.value = value; Invalidate(); } }
+
+    public ProgressLine()
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        e.Graphics.Clear(Theme.ParentBack(this));
+        if (value < 0) return;
+        using (var b = new SolidBrush(Theme.Stroke)) e.Graphics.FillRectangle(b, 0, 0, Width, Height);
+        using (var b = new SolidBrush(Theme.Accent)) e.Graphics.FillRectangle(b, 0, 0, Width * Math.Min(value, 100) / 100, Height);
+    }
+}
+
+class BusyForm : Form
+{
+    protected readonly Label StatusLabel;
+    protected readonly ProgressLine Bar;
+    protected readonly Panel StatusBar;
+
+    protected BusyForm()
+    {
+        Theme.Apply(this);
+        StatusBar = new Panel { Dock = DockStyle.Bottom, Height = Theme.S(36) };
+        Bar = new ProgressLine { Dock = DockStyle.Top, Height = Theme.S(3) };
+        StatusLabel = new Label { Dock = DockStyle.Fill, ForeColor = Theme.TextSecondary, TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(Theme.S(16), 0, Theme.S(16), 0), AutoEllipsis = true };
+        StatusBar.Controls.Add(StatusLabel); StatusBar.Controls.Add(Bar);
+    }
+
+    protected void Report(string s, int pct)
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        try { BeginInvoke((Action)(() => { StatusLabel.Text = pct >= 0 ? s + " — " + pct + "%" : s; Bar.Value = pct; })); }
+        catch (InvalidOperationException) { }
+    }
+
+    protected virtual bool AskPin() { return false; }
+
+    protected async Task<bool> Run(Action<Action<string, int>> work, string done)
+    {
+        try
+        {
+            while (true)
+            {
+                try { await Task.Run(() => work(Report)); break; }
+                catch (PinException) { if (IsDisposed || !AskPin()) throw; }
+            }
+            if (!IsDisposed) { StatusLabel.Text = done; Bar.Value = -1; }
+            return true;
+        }
+        catch (Exception e)
+        {
+            if (IsDisposed) return false;
+            StatusLabel.Text = L.T("Error: ", "Ошибка: ") + e.Message; Bar.Value = -1;
+            MessageBox.Show(this, e.Message, L.T("Error", "Ошибка"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
+        }
+    }
+
+    protected static bool HasFiles(DragEventArgs e) { return e.Data.GetDataPresent(DataFormats.FileDrop); }
+}
+
+class MainForm : Form
+{
+    class Peer { public string Name; public DateTime Seen; }
+
+    readonly Dictionary<string, Peer> peers = new Dictionary<string, Peer>();
+    bool localOpen;
+    readonly Dictionary<string, RemoteForm> remotes = new Dictionary<string, RemoteForm>();
+    readonly Dictionary<string, List<string>> pending = new Dictionary<string, List<string>>();
+    readonly FlowLayoutPanel cards;
+    readonly Label hint;
+    readonly NotifyIcon tray;
+    readonly System.Windows.Forms.Timer batchTimer, pruneTimer, inboxTimer;
+    readonly Dictionary<string, List<string>> inbox = new Dictionary<string, List<string>>();
+    Action balloonClick;
+    public static MainForm Instance;
+    readonly string defaultHint = L.T("Click a computer to open its folder. Drag files onto a remote computer to send them.", "Нажмите на компьютер, чтобы открыть его папку. Перетащите файлы на удалённый компьютер, чтобы отправить их.");
+    bool allowShow, exiting;
+
+    public MainForm(bool startHidden)
+    {
+        allowShow = !startHidden;
+        Theme.Apply(this);
+        Text = "LanFiles"; Icon = Program.AppIcon;
+        ClientSize = new Size(Theme.S(700), Theme.S(348)); MinimumSize = new Size(Theme.S(480), Theme.S(320));
+        StartPosition = FormStartPosition.CenterScreen;
+
+        var header = new Panel { Dock = DockStyle.Top, Height = Theme.S(76) };
+        var title = new Label { Text = L.T("Computers", "Компьютеры"), Font = Theme.Title, AutoSize = true, Location = new Point(Theme.S(26), Theme.S(20)) };
+        var bSettings = new FluentButton(L.T("Settings", "Настройки"), '\uE713', FluentButton.Kind.Subtle);
+        header.Controls.Add(title); header.Controls.Add(bSettings);
+        header.Resize += (s, e) => bSettings.Location = new Point(header.Width - bSettings.Width - Theme.S(20), Theme.S(24));
+
+        cards = new FlowLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(Theme.S(20), Theme.S(4), Theme.S(20), Theme.S(8)), AutoScroll = true };
+        cards.HandleCreated += (s, e) => Native.SetWindowTheme(cards.Handle, "DarkMode_Explorer", null);
+        hint = new Label { Dock = DockStyle.Bottom, Height = Theme.S(44), Padding = new Padding(Theme.S(26), 0, Theme.S(26), Theme.S(6)), ForeColor = Theme.TextSecondary, TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true, Text = defaultHint };
+        Controls.Add(cards); Controls.Add(hint); Controls.Add(header);
+
+        var menu = Menus.Create();
+        Menus.Item(menu, L.T("Open LanFiles", "Открыть LanFiles"), '\uE8A7', null, (s, e) => ShowMain());
+        Menus.Item(menu, L.T("Settings", "Настройки"), '\uE713', null, (s, e) => OpenSettings());
+        menu.Items.Add(new ToolStripSeparator());
+        Menus.Item(menu, L.T("Exit", "Выход"), '\uE7E8', null, (s, e) => ExitApp());
+        tray = new NotifyIcon { Icon = Program.TrayIcon, Text = "LanFiles", ContextMenuStrip = menu, Visible = true };
+        tray.MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) ShowMain(); };
+        tray.BalloonTipClicked += (s, e) => { var a = balloonClick; if (a != null) a(); };
+        Instance = this;
+        bSettings.Click += (s, e) => OpenSettings();
+
+        batchTimer = new System.Windows.Forms.Timer { Interval = 700 };
+        batchTimer.Tick += (s, e) => FlushBatches();
+        pruneTimer = new System.Windows.Forms.Timer { Interval = 5000 };
+        pruneTimer.Tick += (s, e) => Prune();
+        pruneTimer.Start();
+        inboxTimer = new System.Windows.Forms.Timer { Interval = 1500 };
+        inboxTimer.Tick += (s, e) => FlushInbox();
+        Program.Received += (ip, top) =>
+        {
+            if (IsDisposed) return;
+            try
+            {
+                BeginInvoke((Action)(() =>
+                {
+                    List<string> l;
+                    if (!inbox.TryGetValue(ip, out l)) inbox[ip] = l = new List<string>();
+                    if (!l.Contains(top, StringComparer.OrdinalIgnoreCase)) l.Add(top);
+                    inboxTimer.Stop(); inboxTimer.Start();
+                }));
+            }
+            catch (InvalidOperationException) { }
+        };
+
+        CreateHandle();
+        Discovery.Found += OnFound;
+        try { Discovery.Start(); }
+        catch (SocketException) { hint.Text = L.T("Auto-discovery unavailable, enter the IP in Settings", "Автопоиск недоступен, укажите IP в настройках"); }
+        Rebuild();
+        if (Program.CheckUpdates && Updater.Repo != "") CheckUpdatesQuietly();
+    }
+
+    async void CheckUpdatesQuietly()
+    {
+        Updater.Release rel;
+        try { await Task.Delay(5000); rel = await Task.Run(() => Updater.Check()); }
+        catch (Exception) { return; }
+        if (rel == null || IsDisposed) return;
+        Notify(L.T("LanFiles ", "Доступна версия LanFiles ") + rel.Version + L.T(" is available", ""), L.T("Click to update", "Нажмите, чтобы обновить"),
+            () => Updater.Offer(null, rel));
+    }
+
+    public void Notify(string title, string text, Action onClick, bool error = false)
+    {
+        if (IsDisposed) return;
+        balloonClick = onClick;
+        tray.ShowBalloonTip(error ? 8000 : 5000, title, text, error ? ToolTipIcon.Error : ToolTipIcon.Info);
+    }
+
+    void FlushInbox()
+    {
+        inboxTimer.Stop();
+        if (Program.Receiving > 0) { inboxTimer.Start(); return; }
+        var all = inbox.SelectMany(kv => kv.Value).ToList();
+        if (all.Count == 0) return;
+        string first = all[0];
+        string from = inbox.Count == 1 ? NameOf(inbox.Keys.First()) : L.T("computers: ", "компьютеров: ") + inbox.Count;
+        Notify(L.T("Received from ", "Получено от ") + from, all.Count == 1 ? Path.GetFileName(first) : L.T("Items: ", "Объектов: ") + all.Count,
+            () => Process.Start("explorer.exe", "/select,\"" + first + "\""));
+        inbox.Clear();
+    }
+
+    protected override void SetVisibleCore(bool value) { base.SetVisibleCore(allowShow && value); }
+
+    public void ShowMain()
+    {
+        allowShow = true;
+        Show();
+        if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+        Activate();
+    }
+
+    public void Restart() { Program.RestartAfterExit = true; ExitApp(); }
+
+    void ExitApp()
+    {
+        exiting = true;
+        tray.Visible = false;
+        Application.Exit();
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        if (WindowState == FormWindowState.Minimized && Program.TrayOnClose) Hide();
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (!exiting && Program.TrayOnClose && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); return; }
+        tray.Visible = false;
+        base.OnFormClosing(e);
+    }
+
+    void OpenSettings()
+    {
+        ShowMain();
+        bool ru = L.Ru;
+        using (var f = new SettingsForm(false))
+            if (f.ShowDialog(this) == DialogResult.OK) Rebuild(true);
+        if (L.Ru != ru) { Program.RestartAfterExit = true; ExitApp(); }
+    }
+
+    void OnFound(string ip, string name)
+    {
+        if (IsDisposed) return;
+        try
+        {
+            BeginInvoke((Action)(() =>
+            {
+                Peer p;
+                bool changed = !peers.TryGetValue(ip, out p) || p.Name != name;
+                peers[ip] = new Peer { Name = name, Seen = DateTime.Now };
+                if (changed) Rebuild();
+            }));
+        }
+        catch (InvalidOperationException) { }
+    }
+
+    void Prune()
+    {
+        var gone = peers.Where(p => (DateTime.Now - p.Value.Seen).TotalSeconds > 20).Select(p => p.Key).ToList();
+        foreach (var ip in gone) peers.Remove(ip);
+        if (gone.Count > 0) Rebuild();
+    }
+
+    List<KeyValuePair<string, string>> Remotes()
+    {
+        var res = new List<KeyValuePair<string, string>>();
+        if (Program.ManualIp != "") res.Add(new KeyValuePair<string, string>(Program.ManualIp, NameOf(Program.ManualIp)));
+        foreach (var p in peers.OrderBy(p => p.Value.Name))
+            if (p.Key != Program.ManualIp) res.Add(new KeyValuePair<string, string>(p.Key, p.Value.Name));
+        return res;
+    }
+
+    string NameOf(string ip)
+    {
+        Peer p;
+        return peers.TryGetValue(ip, out p) ? p.Name : ip;
+    }
+
+    void Rebuild(bool force = false)
+    {
+        var list = Remotes();
+        Program.UpdateExplorerMenu(list);
+        string sig = string.Join(";", list.Select(p => p.Key + "=" + p.Value)) + "|" + string.Join("|", Program.Roots) + "|" + Program.MyName;
+        if (!force && (string)cards.Tag == sig) return;
+        cards.Tag = sig;
+
+        cards.SuspendLayout();
+        foreach (Control c in cards.Controls.Cast<Control>().ToList()) c.Dispose();
+        var roots = Program.Roots;
+        string folderName = Path.GetFileName(Program.Root.TrimEnd('\\'));
+        var local = new PcCard(Program.MyName, L.T("This computer", "Этот компьютер") + "\n" + (roots.Count == 1
+            ? (folderName == "" ? Program.Root : folderName)
+            : L.T("Folders: ", "Папок: ") + roots.Count)) { Local = true, Collapsed = !localOpen };
+        local.Click += (s, e) =>
+        {
+            if (local.Collapsed) { localOpen = true; local.Collapsed = false; return; }
+            if (PcCard.CollapseBox.Contains(local.PointToClient(Cursor.Position))) { localOpen = false; local.Collapsed = true; return; }
+            if (roots.Count == 1) { Process.Start("explorer.exe", "\"" + roots[0] + "\""); return; }
+            var m = Menus.Create();
+            foreach (var r in roots) { string path = r; Menus.Item(m, path, '\uE8B7', null, (s2, e2) => Process.Start("explorer.exe", "\"" + path + "\"")); }
+            m.Show(Cursor.Position);
+        };
+        cards.Controls.Add(local);
+
+        foreach (var kv in list)
+        {
+            string ip = kv.Key, name = kv.Value;
+            bool seen = peers.ContainsKey(ip);
+            var card = new PcCard(name, ip) { AllowDrop = true, MonoSub = true, Status = seen ? 1 : 2 };
+            card.Click += (s, e) => OpenRemote(ip, name);
+            card.DragEnter += (s, e) =>
+            {
+                e.Effect = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
+                card.DropHighlight = true; card.Invalidate();
+            };
+            card.DragLeave += (s, e) => { card.DropHighlight = false; card.Invalidate(); };
+            card.DragDrop += (s, e) =>
+            {
+                card.DropHighlight = false; card.Invalidate();
+                SendBatch(ip, ((string[])e.Data.GetData(DataFormats.FileDrop)).ToList());
+            };
+            cards.Controls.Add(card);
+        }
+        if (list.Count == 0)
+            cards.Controls.Add(new PcCard(L.T("Looking for computers…", "Поиск компьютеров…"), L.T("Run LanFiles on another computer in this network", "Запустите LanFiles на другом компьютере этой сети")) { Enabled = false });
+        cards.ResumeLayout();
+    }
+
+    void OpenRemote(string ip, string name)
+    {
+        RemoteForm f;
+        if (remotes.TryGetValue(ip, out f) && !f.IsDisposed) { f.WindowState = FormWindowState.Normal; f.Activate(); return; }
+        f = new RemoteForm(ip, name);
+        remotes[ip] = f;
+        f.Show();
+    }
+
+    public void OnPipe(string line)
+    {
+        if (IsDisposed) return;
+        try
+        {
+            BeginInvoke((Action)(() =>
+            {
+                var p = line.Split('\t');
+                if (p[0] == "SHOW") ShowMain();
+                else if (p[0] == "SEND" && p.Length == 3)
+                {
+                    List<string> l;
+                    if (!pending.TryGetValue(p[1], out l)) pending[p[1]] = l = new List<string>();
+                    l.Add(p[2]);
+                    batchTimer.Stop(); batchTimer.Start();
+                }
+            }));
+        }
+        catch (InvalidOperationException) { }
+    }
+
+    void FlushBatches()
+    {
+        batchTimer.Stop();
+        foreach (var kv in pending.ToList()) SendBatch(kv.Key, kv.Value.Distinct().ToList());
+        pending.Clear();
+    }
+
+    async void SendBatch(string ip, List<string> paths)
+    {
+        string name = NameOf(ip);
+        Action<string, int> report = (s, pct) =>
+        {
+            if (IsDisposed) return;
+            try
+            {
+                BeginInvoke((Action)(() =>
+                {
+                    string t = s + " — " + pct + "%";
+                    hint.Text = t;
+                    tray.Text = t.Length > 63 ? t.Substring(0, 63) : t;
+                }));
+            }
+            catch (InvalidOperationException) { }
+        };
+        try
+        {
+            while (true)
+            {
+                try { await Task.Run(() => { foreach (var p in paths) Client.Upload(ip, p, "", report); }); break; }
+                catch (PinException) { if (IsDisposed || !PinPrompt.Ask(Visible ? this : null, ip, name)) throw; }
+            }
+            string what = paths.Count == 1 ? Path.GetFileName(paths[0].TrimEnd('\\')) : L.T("Items: ", "Объектов: ") + paths.Count;
+            Notify(L.T("Sent to ", "Отправлено на ") + name, what, null);
+        }
+        catch (Exception e)
+        {
+            Notify(L.T("Could not send to ", "Не удалось отправить на ") + name, e.Message, null, true);
+        }
+        finally
+        {
+            if (!IsDisposed) { hint.Text = defaultHint; tray.Text = "LanFiles"; }
+        }
+    }
+}
+
+static class PinPrompt
+{
+    public static bool Ask(IWin32Window owner, string ip, string pcName)
+    {
+        using (var f = new Form())
+        {
+            Theme.Apply(f);
+            f.Text = L.T("Computer password", "Пароль компьютера"); f.Icon = Program.AppIcon;
+            f.FormBorderStyle = FormBorderStyle.FixedSingle; f.MaximizeBox = f.MinimizeBox = false;
+            f.StartPosition = owner == null ? FormStartPosition.CenterScreen : FormStartPosition.CenterParent;
+            f.ShowInTaskbar = owner == null; f.TopMost = owner == null;
+            int w = Theme.S(400), pad = Theme.S(24);
+            var title = new Label { Text = pcName, Font = Theme.Subtitle, AutoEllipsis = true, Location = new Point(pad, Theme.S(20)), Size = new Size(w, Theme.S(32)) };
+            var sub = new Label { Text = L.T("Enter the password set in LanFiles settings on that computer. It will be remembered.", "Введите пароль, заданный в настройках LanFiles на этом компьютере. Он запомнится."), ForeColor = Theme.TextSecondary, Location = new Point(pad, Theme.S(56)), Size = new Size(w, Theme.S(44)) };
+            var box = new FluentTextBox(w) { Location = new Point(pad, Theme.S(108)) };
+            box.Box.UseSystemPasswordChar = true;
+            var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = Theme.S(68), FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(Theme.S(18), Theme.S(16), Theme.S(18), 0), BackColor = Color.FromArgb(28, 28, 28) };
+            var ok = new FluentButton(L.T("Connect", "Подключиться"), '\0', FluentButton.Kind.Accent) { Width = Theme.S(140), DialogResult = DialogResult.OK };
+            var cancel = new FluentButton(L.T("Cancel", "Отмена")) { Width = Theme.S(120), DialogResult = DialogResult.Cancel };
+            ok.Margin = cancel.Margin = new Padding(Theme.S(4), 0, Theme.S(4), 0);
+            bottom.Controls.Add(cancel); bottom.Controls.Add(ok);
+            f.AcceptButton = ok; f.CancelButton = cancel;
+            f.Controls.Add(title); f.Controls.Add(sub); f.Controls.Add(box); f.Controls.Add(bottom);
+            f.ClientSize = new Size(w + 2 * pad, Theme.S(108) + box.Height + Theme.S(24) + bottom.Height);
+            f.Shown += (s, e) => box.Box.Focus();
+            if (f.ShowDialog(owner) != DialogResult.OK || box.Value == "") return false;
+            try { Program.RememberPin(ip, box.Value, true); }
+            catch (IOException) { Program.RememberPin(ip, box.Value, false); }
+            catch (UnauthorizedAccessException) { Program.RememberPin(ip, box.Value, false); }
+            return true;
+        }
+    }
+}
+
+class SettingsForm : Form
+{
+    readonly bool firstRun;
+    readonly List<string> folders = new List<string>(Program.Roots);
+    bool ru = L.Ru;
+    readonly int w = Theme.S(600);
+    readonly FlowLayoutPanel flow;
+    readonly Label title;
+    readonly Panel bottom;
+    readonly List<Control> folderRows = new List<Control>(), otherRows = new List<Control>();
+    readonly Control foldersHeader;
+    readonly FluentTextBox nameBox, pin, ipBox;
+    readonly Toggle autostart, tray, menu, updates;
+    readonly ToolTip tipUpd = Theme.MakeTip();
+
+    public SettingsForm(bool firstRun)
+    {
+        this.firstRun = firstRun;
+        Theme.Apply(this);
+        Text = firstRun ? L.T("LanFiles setup", "Настройка LanFiles") : L.T("LanFiles settings", "Настройки LanFiles"); Icon = Program.AppIcon;
+        FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = MinimizeBox = false;
+        StartPosition = firstRun ? FormStartPosition.CenterScreen : FormStartPosition.CenterParent;
+        ShowInTaskbar = firstRun;
+
+        flow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true, Padding = new Padding(Theme.S(20), Theme.S(16), Theme.S(20), Theme.S(8)) };
+        flow.HandleCreated += (s, e) => Native.SetWindowTheme(flow.Handle, "DarkMode_Explorer", null);
+        title = new Label { Text = firstRun ? L.T("Welcome", "Добро пожаловать") : L.T("Settings", "Настройки"), Font = Theme.Title, AutoSize = true, Margin = new Padding(0, 0, 0, Theme.S(12)) };
+        Label dummy;
+
+        var bAdd = new FluentButton(L.T("Add folder…", "Добавить папку…"), '');
+        bAdd.Click += (s, e) =>
+        {
+            string p = FolderPicker.Pick(this, L.T("Shared folder", "Общая папка"), folders.Count > 0 ? folders[0] : null);
+            if (p != null && !folders.Contains(p, StringComparer.OrdinalIgnoreCase)) { folders.Add(p); Layout2(); }
+        };
+        foldersHeader = Section(w, L.T("Shared folders", "Общие папки"), bAdd);
+        otherRows.Add(Section(w, L.T("Connection", "Подключение"), null));
+
+        nameBox = new FluentTextBox(Theme.S(170)) { Value = Program.MyName };
+        otherRows.Add(Row(w, '', L.T("Computer name", "Имя компьютера"), L.T("Shown to other computers", "Так его видят другие компьютеры"), nameBox, out dummy));
+        pin = new FluentTextBox(Theme.S(170)) { Value = Program.Pin };
+        otherRows.Add(Row(w, '', L.T("Password of this computer", "Пароль этого компьютера"), L.T("Other PCs enter it to connect here, 4+ characters", "Его вводят другие ПК для входа сюда, от 4 символов"), pin, out dummy));
+        ipBox = new FluentTextBox(Theme.S(170)) { Value = Program.ManualIp };
+        otherRows.Add(Row(w, '', L.T("Remote computer IP", "IP удалённого компьютера"), L.T("Only if auto-discovery misses it", "Только если автопоиск его не видит"), ipBox, out dummy));
+        otherRows.Add(Section(w, L.T("App", "Программа"), null));
+        autostart = new Toggle { Checked = Program.Autostart };
+        otherRows.Add(Row(w, '', L.T("Start with Windows", "Запускать вместе с Windows"), L.T("Starts minimized to the tray", "Программа стартует свёрнутой в трей"), autostart, out dummy));
+        tray = new Toggle { Checked = Program.TrayOnClose };
+        otherRows.Add(Row(w, '', L.T("Minimize to tray", "Сворачивать в трей"), L.T("Closing the window keeps it running in the tray", "Закрытое окно продолжает работать в трее"), tray, out dummy));
+        menu = new Toggle { Checked = Program.ExplorerMenu };
+        otherRows.Add(Row(w, '', L.T("“Send to computer” in Explorer", "«Отправить на компьютер» в Проводнике"), L.T("Right-click menu item for files and folders", "Пункт в меню правой кнопки для файлов и папок"), menu, out dummy));
+
+        var bLang = new FluentButton(ru ? "Русский" : "English", '') { Width = Theme.S(170) };
+        var langMenu = Menus.Create();
+        Menus.Item(langMenu, "English", '\0', null, (s, e) => { ru = false; bLang.Text = "English"; });
+        Menus.Item(langMenu, "Русский", '\0', null, (s, e) => { ru = true; bLang.Text = "Русский"; });
+        bLang.Click += (s, e) => langMenu.Show(bLang, new Point(0, bLang.Height));
+        otherRows.Add(Row(w, '', "Language / Язык", L.T("LanFiles restarts to apply it", "Программа перезапустится сама"), bLang, out dummy));
+
+        updates = new Toggle { Checked = Program.CheckUpdates };
+        var bUpd = new FluentButton(L.T("Check now", "Проверить"), '\uE72C');
+        bUpd.Click += async (s, e) =>
+        {
+            if (Updater.Repo == "")
+            {
+                MessageBox.Show(this, L.T("Updates will come from GitHub releases. The repository is not set up yet.", "Обновления будут приходить из релизов на GitHub. Репозиторий пока не подключён."),
+                    L.T("Updates", "Обновления"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            bUpd.Enabled = false;
+            Updater.Release rel = null; string err = null;
+            try { rel = await Task.Run(() => Updater.Check()); }
+            catch (Exception ex) { err = ex.Message; }
+            if (IsDisposed) return;
+            bUpd.Enabled = true;
+            if (err != null) MessageBox.Show(this, err, L.T("Could not check for updates", "Не удалось проверить обновления"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            else if (rel == null) MessageBox.Show(this, L.T("You have the latest version.", "У вас последняя версия."), L.T("Updates", "Обновления"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+            else Updater.Offer(this, rel);
+        };
+        var updBox = new Panel { BackColor = Theme.Layer, Size = new Size(updates.Width + Theme.S(12) + bUpd.Width, Math.Max(updates.Height, bUpd.Height)) };
+        updates.Location = new Point(0, (updBox.Height - updates.Height) / 2);
+        bUpd.Location = new Point(updates.Width + Theme.S(12), (updBox.Height - bUpd.Height) / 2);
+        updBox.Controls.Add(updates); updBox.Controls.Add(bUpd);
+        tipUpd.SetToolTip(updates, L.T("Check for updates at startup", "Проверять обновления при запуске"));
+        otherRows.Add(Row(w, '\uE895', L.T("Updates", "Обновления"), L.T("Version ", "Версия ") + Updater.Current + L.T(", checked at startup from GitHub", ", проверка при запуске на GitHub"), updBox, out dummy));
+
+        bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = Theme.S(68), FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(Theme.S(18), Theme.S(16), Theme.S(18), 0), BackColor = Color.FromArgb(28, 28, 28) };
+        var save = new FluentButton(L.T("Save", "Сохранить"), '\0', FluentButton.Kind.Accent) { Width = Theme.S(130) };
+        var cancel = new FluentButton(firstRun ? L.T("Exit", "Выход") : L.T("Cancel", "Отмена")) { Width = Theme.S(130), DialogResult = DialogResult.Cancel };
+        save.Margin = cancel.Margin = new Padding(Theme.S(4), 0, Theme.S(4), 0);
+        bottom.Controls.Add(cancel); bottom.Controls.Add(save);
+        save.Click += (s, e) => Save();
+        AcceptButton = save; CancelButton = cancel;
+
+        Controls.Add(flow); Controls.Add(bottom);
+        var wheel = new WheelScroll(flow);
+        Shown += (s, e) => Application.AddMessageFilter(wheel);
+        FormClosed += (s, e) => Application.RemoveMessageFilter(wheel);
+        Layout2();
+    }
+
+    void Layout2()
+    {
+        flow.SuspendLayout();
+        flow.Controls.Clear();
+        foreach (var c in folderRows) c.Dispose();
+        folderRows.Clear();
+        flow.Controls.Add(title);
+        flow.Controls.Add(foldersHeader);
+        for (int i = 0; i < folders.Count; i++)
+        {
+            string f = folders[i];
+            var bRemove = new FluentButton(L.T("Remove", "Убрать"), '') { Enabled = folders.Count > 1 };
+            bRemove.Click += (s, e) => { folders.Remove(f); BeginInvoke((Action)Layout2); };
+            Label dummy;
+            var row = Row(w, '', f, i == 0 ? L.T("Inbox, received files land here", "Входящие: сюда приходят файлы") : L.T("Shared", "Общая"), bRemove, out dummy);
+            folderRows.Add(row);
+            flow.Controls.Add(row);
+        }
+        if (folders.Count == 0)
+        {
+            Label dummy;
+            var hint = Row(w, '\uE8B7', L.T("No folder yet", "Папок пока нет"), L.T("Received files go to the first folder", "Файлы приходят в первую папку"), new Panel { Width = 1, Height = 1 }, out dummy);
+            folderRows.Add(hint); flow.Controls.Add(hint);
+        }
+        foreach (var c in otherRows) flow.Controls.Add(c);
+        flow.ResumeLayout();
+
+        int content = flow.Padding.Vertical + flow.Controls.Cast<Control>().Sum(c => c.Height + c.Margin.Vertical);
+        int max = Screen.FromControl(this).WorkingArea.Height * 90 / 100 - bottom.Height - (Height - ClientSize.Height);
+        int h = Math.Min(content, max);
+        ClientSize = new Size(w + flow.Padding.Horizontal + (content > max ? SystemInformation.VerticalScrollBarWidth : 0), h + bottom.Height);
+    }
+
+    static Control Section(int width, string text, Control right)
+    {
+        var p = new Panel { Size = new Size(width, Theme.S(40)), Margin = new Padding(0, Theme.S(12), 0, Theme.S(4)) };
+        p.Controls.Add(new Label { Text = text, Font = Theme.Strong, AutoSize = true, Location = new Point(Theme.S(4), Theme.S(12)) });
+        if (right != null) { right.Location = new Point(width - right.Width, (p.Height - right.Height) / 2); p.Controls.Add(right); }
+        return p;
+    }
+
+    static Control Row(int width, char glyph, string title, string sub, Control right, out Label subLabel)
+    {
+        int h = Theme.S(60);
+        var p = new RoundPanel { Glyph = glyph, Size = new Size(width, h), Margin = new Padding(0, 0, 0, Theme.S(4)) };
+        int x = Theme.S(56), tw = width - x - right.Width - Theme.S(32);
+        var t = new Label { Text = title, Location = new Point(x, Theme.S(10)), Size = new Size(tw, Theme.S(22)), BackColor = Theme.Layer, ForeColor = Theme.Text, AutoEllipsis = true };
+        subLabel = new Label { Text = sub, Location = new Point(x, Theme.S(32)), Size = new Size(tw, Theme.S(20)), BackColor = Theme.Layer, ForeColor = Theme.TextSecondary, Font = Theme.Small, AutoEllipsis = true };
+        right.Location = new Point(width - right.Width - Theme.S(16), (h - right.Height) / 2);
+        p.Controls.Add(t); p.Controls.Add(subLabel); p.Controls.Add(right);
+        return p;
+    }
+
+    void Save()
+    {
+        string ip = ipBox.Value.Trim(), newPin = pin.Value.Trim(), name = Program.CleanName(nameBox.Value);
+        IPAddress a;
+        string err = folders.Count == 0 ? L.T("Add a shared folder.", "Добавьте общую папку.")
+            : !Directory.Exists(folders[0]) ? L.T("The first folder does not exist: ", "Первая папка не найдена: ") + folders[0]
+            : newPin.Length < 4 ? L.T("The password must be at least 4 characters.", "Пароль должен быть не короче 4 символов.")
+            : ip != "" && !IPAddress.TryParse(ip, out a) ? L.T("Not an IP address: ", "Это не IP-адрес: ") + ip : null;
+        if (err != null) { MessageBox.Show(this, err, L.T("Settings", "Настройки"), MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+        Program.Roots = new List<string>(folders); Program.Pin = newPin; Program.ManualIp = ip;
+        Program.PcName = name == Environment.MachineName ? "" : name;
+        Program.TrayOnClose = tray.Checked; Program.ExplorerMenu = menu.Checked; Program.CheckUpdates = updates.Checked; L.Ru = ru;
+        try
+        {
+            Program.SaveSettings();
+            Program.Autostart = autostart.Checked;
+        }
+        catch (Exception e)
+        {
+            if (!(e is IOException || e is UnauthorizedAccessException)) throw;
+            MessageBox.Show(this, e.Message, L.T("Could not save", "Не удалось сохранить"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+        DialogResult = DialogResult.OK;
+    }
+}
+
+class WheelScroll : IMessageFilter
+{
+    readonly ScrollableControl target;
+    public WheelScroll(ScrollableControl target) { this.target = target; }
+
+    public bool PreFilterMessage(ref Message m)
+    {
+        if (m.Msg != 0x020A || !target.IsHandleCreated || !target.VerticalScroll.Visible) return false;
+        if (!target.RectangleToScreen(target.ClientRectangle).Contains(Cursor.Position)) return false;
+        int delta = (short)(((long)m.WParam >> 16) & 0xFFFF);
+        int y = -target.AutoScrollPosition.Y - delta * Theme.S(64) / 120;
+        target.AutoScrollPosition = new Point(0, Math.Max(0, y));
+        return true;
+    }
+}
+
+static class Updater
+{
+    public static readonly string Repo = "idLorem/LanFiles";
+    public static string Current { get { var v = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version; return v.Major + "." + v.Minor + "." + v.Build; } }
+
+    public class Release { public string Version, Page, Asset; }
+
+    public static Release Parse(string json, string current)
+    {
+        var d = (Dictionary<string, object>)new System.Web.Script.Serialization.JavaScriptSerializer().DeserializeObject(json);
+        string tag = Convert.ToString(d["tag_name"]).Trim().TrimStart('v', 'V');
+        Version v, cur;
+        if (!Version.TryParse(tag, out v) || !Version.TryParse(current, out cur)) return null;
+        if (Norm(v) <= Norm(cur)) return null;
+        string asset = null, prefix = "https://github.com/" + Repo + "/releases/download/";
+        object list;
+        if (d.TryGetValue("assets", out list) && list is object[])
+            foreach (var o in (object[])list)
+            {
+                var a = o as Dictionary<string, object>;
+                if (a == null || !string.Equals(Convert.ToString(a["name"]), "LanFiles.exe", StringComparison.OrdinalIgnoreCase)) continue;
+                string url = Convert.ToString(a["browser_download_url"]);
+                if (url.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) asset = url;
+            }
+        return new Release { Version = tag, Page = Convert.ToString(d["html_url"]), Asset = asset };
+    }
+
+    static void Install(Release r)
+    {
+        if (r.Asset == null) throw new IOException(L.T("The release has no LanFiles.exe.", "В релизе нет LanFiles.exe."));
+        string exe = Application.ExecutablePath, fresh = exe + ".new", old = exe + ".old";
+        try
+        {
+            using (var wc = new WebClient())
+            {
+                wc.Headers[HttpRequestHeader.UserAgent] = "LanFiles-updater";
+                wc.DownloadFile(r.Asset, fresh);
+            }
+            var v = System.Reflection.AssemblyName.GetAssemblyName(fresh).Version;
+            if (Norm(v) != Norm(Version.Parse(r.Version)))
+                throw new IOException(L.T("The downloaded file has a different version.", "Скачанный файл другой версии."));
+            if (File.Exists(old)) File.Delete(old);
+            File.Move(exe, old);
+            try { File.Move(fresh, exe); }
+            catch (Exception) { File.Move(old, exe); throw; }
+        }
+        finally { try { File.Delete(fresh); } catch (Exception) { } }
+    }
+
+    static Version Norm(Version v) { return new Version(v.Major, v.Minor, Math.Max(v.Build, 0), Math.Max(v.Revision, 0)); }
+
+    public static Release Check()
+    {
+        ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
+        using (var wc = new WebClient())
+        {
+            wc.Headers[HttpRequestHeader.UserAgent] = "LanFiles-updater";
+            wc.Encoding = Encoding.UTF8;
+            return Parse(wc.DownloadString("https://api.github.com/repos/" + Repo + "/releases/latest"), Current);
+        }
+    }
+
+    public static async void Offer(IWin32Window owner, Release r)
+    {
+        if (MessageBox.Show(owner, L.T("LanFiles ", "Доступна версия LanFiles ") + r.Version + L.T(" is available. Update now?", ". Обновить сейчас?"),
+                L.T("Updates", "Обновления"), MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes) return;
+        string err = null;
+        Cursor.Current = Cursors.WaitCursor;
+        try { await Task.Run(() => Install(r)); }
+        catch (Exception ex) { err = ex.Message; }
+        if (err == null) { if (MainForm.Instance != null) MainForm.Instance.Restart(); return; }
+        if (MessageBox.Show(err + L.T("\n\nOpen the download page?", "\n\nОткрыть страницу загрузки?"), L.T("Could not update", "Не удалось обновить"),
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes
+            && r.Page.StartsWith("https://github.com/", StringComparison.OrdinalIgnoreCase))
+            Process.Start(r.Page);
+    }
+}
+
+class RemoteForm : BusyForm
+{
+    readonly string ip, pcName;
+    string cur = "";
+    readonly ListView lv;
+    readonly Label crumb;
+    readonly EmptyState empty;
+    bool online;
+    readonly FluentButton bUp, bDown, bRen, bDel;
+    readonly ImageList icons;
+    readonly Dictionary<string, string> typeNames = new Dictionary<string, string>();
+
+    public RemoteForm(string ip, string name)
+    {
+        this.ip = ip; pcName = name;
+        Text = name + " — LanFiles"; Icon = Program.AppIcon;
+        ClientSize = new Size(Theme.S(860), Theme.S(560)); MinimumSize = new Size(Theme.S(560), Theme.S(380));
+        StartPosition = FormStartPosition.CenterScreen;
+        var tip = Theme.MakeTip();
+
+        var bar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = Theme.S(52), Padding = new Padding(Theme.S(12), Theme.S(10), Theme.S(12), 0), WrapContents = false };
+        bUp = new FluentButton("", '\uE74A', FluentButton.Kind.Subtle);
+        var bRefresh = new FluentButton("", '\uE72C', FluentButton.Kind.Subtle);
+        var bSendFiles = new FluentButton(L.T("Send files", "Отправить файлы"), '\uE898', FluentButton.Kind.Subtle);
+        var bSendFolder = new FluentButton(L.T("Send folder", "Отправить папку"), '\uE8B7', FluentButton.Kind.Subtle);
+        bDown = new FluentButton(L.T("Download", "Скачать к себе"), '\uE896', FluentButton.Kind.Subtle);
+        bRen = new FluentButton("", '\uE8AC', FluentButton.Kind.Subtle);
+        bDel = new FluentButton("", '\uE74D', FluentButton.Kind.Subtle);
+        tip.SetToolTip(bUp, L.T("Up (Backspace)", "Вверх (Backspace)")); tip.SetToolTip(bRefresh, L.T("Refresh (F5)", "Обновить (F5)"));
+        tip.SetToolTip(bRen, L.T("Rename (F2)", "Переименовать (F2)")); tip.SetToolTip(bDel, L.T("Move to Recycle Bin (Delete)", "Удалить в корзину (Delete)"));
+        bar.Controls.AddRange(new Control[] { bUp, bRefresh, Separator(), bSendFiles, bSendFolder, bDown, Separator(), bRen, bDel });
+
+        crumb = new Label { Dock = DockStyle.Top, Height = Theme.S(44), Font = Theme.Subtitle, Padding = new Padding(Theme.S(36), 0, Theme.S(22), 0), TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true };
+        crumb.Paint += (s, e) =>
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            int d = Theme.S(8);
+            using (var b = new SolidBrush(online ? Theme.Online : Theme.TextTertiary)) e.Graphics.FillEllipse(b, Theme.S(22), (crumb.Height - d) / 2, d, d);
+        };
+
+        lv = new ListView
+        {
+            Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, AllowDrop = true, HideSelection = false, LabelEdit = true,
+            BorderStyle = BorderStyle.None, BackColor = Theme.Bg, ForeColor = Theme.Text, OwnerDraw = true
+        };
+        lv.Columns.Add(L.T("Name", "Имя"), Theme.S(600));
+        icons = new ImageList { ColorDepth = ColorDepth.Depth32Bit, ImageSize = new Size(Theme.S(26), Theme.S(32)) };
+        lv.SmallImageList = icons;
+        lv.HandleCreated += (s, e) =>
+        {
+            Native.SetWindowTheme(lv.Handle, "DarkMode_ItemsView", null);
+            Native.SetWindowTheme(Native.SendMessage(lv.Handle, 0x101F , IntPtr.Zero, IntPtr.Zero), "DarkMode_Explorer", null);
+        };
+        lv.DrawColumnHeader += DrawHeader;
+        lv.DrawItem += (s, e) => { };
+        lv.DrawSubItem += DrawRow;
+        lv.Resize += (s, e) =>
+        {
+            lv.Columns[0].Width = lv.ClientSize.Width + 2;
+            Native.ShowScrollBar(lv.Handle, 0 , false);
+        };
+        lv.MouseMove += (s, e) => SetHot(lv.GetItemAt(e.X, e.Y));
+        lv.MouseLeave += (s, e) => SetHot(null);
+        lv.GotFocus += (s, e) => lv.Invalidate();
+        lv.LostFocus += (s, e) => lv.Invalidate();
+        var host = new Panel { Dock = DockStyle.Fill, Padding = new Padding(Theme.S(12), 0, Theme.S(12), 0) };
+        host.Controls.Add(lv);
+        empty = new EmptyState { Visible = false, AllowDrop = true, BackColor = Theme.Bg };
+        lv.Controls.Add(empty);
+        lv.Resize += (s, e) => { int top = Theme.S(32); empty.Bounds = new Rectangle(0, top, lv.ClientSize.Width, Math.Max(0, lv.ClientSize.Height - top)); };
+        empty.DragEnter += (s, e) => e.Effect = HasFiles(e) ? DragDropEffects.Copy : DragDropEffects.None;
+        empty.DragDrop += (s, e) => Upload((string[])e.Data.GetData(DataFormats.FileDrop));
+
+        Controls.Add(host); Controls.Add(StatusBar); Controls.Add(crumb); Controls.Add(bar);
+        StatusLabel.Text = L.T("Loading", "Загрузка");
+
+        var m = Menus.Create();
+        var mOpen = Menus.Item(m, L.T("Open", "Открыть"), '\uE8E5', "Enter", (s, e) => OpenSelected());
+        var mDown = Menus.Item(m, L.T("Download", "Скачать к себе"), '\uE896', null, (s, e) => DownloadSelected());
+        m.Items.Add(new ToolStripSeparator());
+        var mCopy = Menus.Item(m, L.T("Copy", "Копировать"), '\uE8C8', "Ctrl+C", (s, e) => CopySelected());
+        var mPaste = Menus.Item(m, L.T("Paste", "Вставить"), '\uE77F', "Ctrl+V", (s, e) => Paste());
+        var mRen = Menus.Item(m, L.T("Rename", "Переименовать"), '\uE8AC', "F2", (s, e) => BeginRename());
+        var mDel = Menus.Item(m, L.T("Delete", "Удалить"), '\uE74D', "Del", (s, e) => DeleteSelected());
+        m.Items.Add(new ToolStripSeparator());
+        Menus.Item(m, L.T("Send files…", "Отправить файлы…"), '\uE898', null, (s, e) => SendFiles());
+        Menus.Item(m, L.T("Send folder…", "Отправить папку…"), '\uE8B7', null, (s, e) => SendFolder());
+        Menus.Item(m, L.T("Refresh", "Обновить"), '\uE72C', "F5", (s, e) => Reload());
+        m.Opening += (s, e) =>
+        {
+            int n = lv.SelectedItems.Count;
+            mOpen.Enabled = n == 1; mDown.Enabled = mCopy.Enabled = mDel.Enabled = n > 0; mRen.Enabled = n == 1;
+            try { mPaste.Enabled = Clipboard.ContainsFileDropList(); } catch (ExternalException) { mPaste.Enabled = false; }
+        };
+        lv.ContextMenuStrip = m;
+
+        bUp.Click += (s, e) => Up();
+        bRefresh.Click += (s, e) => Reload();
+        bSendFiles.Click += (s, e) => SendFiles();
+        bSendFolder.Click += (s, e) => SendFolder();
+        bDown.Click += (s, e) => DownloadSelected();
+        bRen.Click += (s, e) => BeginRename();
+        bDel.Click += (s, e) => DeleteSelected();
+        lv.SelectedIndexChanged += (s, e) => UpdateButtons();
+        lv.DoubleClick += (s, e) => OpenSelected();
+        lv.KeyDown += (s, e) =>
+        {
+            if (e.KeyCode == Keys.Back) Up();
+            else if (e.KeyCode == Keys.Enter) OpenSelected();
+            else if (e.KeyCode == Keys.Delete) DeleteSelected();
+            else if (e.KeyCode == Keys.F2) BeginRename();
+            else if (e.KeyCode == Keys.F5) Reload();
+            else if (e.Control && e.KeyCode == Keys.C) CopySelected();
+            else if (e.Control && e.KeyCode == Keys.V) Paste();
+            else if (e.Control && e.KeyCode == Keys.A) foreach (ListViewItem i in lv.Items) i.Selected = true;
+            else return;
+            e.Handled = e.SuppressKeyPress = true;
+        };
+        lv.AfterLabelEdit += async (s, e) =>
+        {
+            e.CancelEdit = true;
+            if (string.IsNullOrWhiteSpace(e.Label) || e.Item < 0 || e.Item >= lv.Items.Count) return;
+            var en = (Entry)lv.Items[e.Item].Tag;
+            string rel = Client.Join(cur, en.Name), nn = e.Label.Trim();
+            if (nn == en.Name) return;
+            if (await Run(r => Client.Rename(ip, rel, nn), L.T("Renamed", "Переименовано"))) Reload();
+        };
+        lv.DragEnter += (s, e) => e.Effect = HasFiles(e) ? DragDropEffects.Copy : DragDropEffects.None;
+        lv.DragDrop += (s, e) => Upload((string[])e.Data.GetData(DataFormats.FileDrop));
+        Shown += (s, e) => Reload();
+        UpdateButtons();
+    }
+
+    static Control Separator()
+    {
+        return new Panel { Width = 1, Height = Theme.S(20), BackColor = Theme.Stroke, Margin = new Padding(Theme.S(6), Theme.S(8), Theme.S(6), 0) };
+    }
+
+    static void Columns(Rectangle row, out Rectangle name, out Rectangle type, out Rectangle size)
+    {
+        int sizeW = Theme.S(110), typeW = row.Width > Theme.S(560) ? Theme.S(210) : 0;
+        size = new Rectangle(row.Right - sizeW - Theme.S(12), row.Y, sizeW, row.Height);
+        type = new Rectangle(size.X - typeW, row.Y, typeW, row.Height);
+        name = new Rectangle(row.X, row.Y, type.X - row.X, row.Height);
+    }
+
+    void DrawHeader(object sender, DrawListViewColumnHeaderEventArgs e)
+    {
+        using (var b = new SolidBrush(Theme.Bg)) e.Graphics.FillRectangle(b, e.Bounds);
+        Rectangle n, t, sz;
+        Columns(e.Bounds, out n, out t, out sz);
+        var f = TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis;
+        TextRenderer.DrawText(e.Graphics, L.T("Name", "Имя"), Theme.Small, new Rectangle(n.X + Theme.S(12), n.Y, n.Width, n.Height), Theme.TextSecondary, f);
+        if (t.Width > 0) TextRenderer.DrawText(e.Graphics, L.T("Type", "Тип"), Theme.Small, new Rectangle(t.X + Theme.S(8), t.Y, t.Width, t.Height), Theme.TextSecondary, f);
+        TextRenderer.DrawText(e.Graphics, L.T("Size", "Размер"), Theme.Small, sz, Theme.TextSecondary, f | TextFormatFlags.Right);
+        using (var p = new Pen(Theme.Stroke)) e.Graphics.DrawLine(p, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
+    }
+
+    ListViewItem hot;
+
+    void SetHot(ListViewItem item)
+    {
+        if (item == hot) return;
+        if (hot != null && hot.ListView != null) lv.Invalidate(hot.Bounds);
+        hot = item;
+        if (hot != null) lv.Invalidate(hot.Bounds);
+    }
+
+    void DrawRow(object sender, DrawListViewSubItemEventArgs e)
+    {
+        var g = e.Graphics;
+        var row = e.Bounds;
+        using (var b = new SolidBrush(Theme.Bg)) g.FillRectangle(b, row);
+        bool sel = e.Item.Selected;
+        if (sel || e.Item == hot)
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            var r = new Rectangle(row.X + Theme.S(2), row.Y + 1, row.Width - Theme.S(4), row.Height - 2);
+            using (var path = Theme.Round(r, Theme.S(4)))
+            using (var b = new SolidBrush(sel ? (lv.Focused ? Color.FromArgb(62, 62, 62) : Color.FromArgb(52, 52, 52)) : Theme.Layer))
+                g.FillPath(b, path);
+            if (sel)
+                using (var path = Theme.Round(new Rectangle(r.X, r.Y + r.Height / 4, Theme.S(3), r.Height / 2), Theme.S(1)))
+                using (var b = new SolidBrush(Theme.Accent.GetBrightness() < 0.35f ? Theme.Text : Theme.Accent))
+                    g.FillPath(b, path);
+            g.SmoothingMode = SmoothingMode.None;
+        }
+        Rectangle n, t, sz;
+        Columns(row, out n, out t, out sz);
+        var img = e.Item.ImageKey != null && icons.Images.ContainsKey(e.Item.ImageKey) ? icons.Images[e.Item.ImageKey] : null;
+        int x = n.X + Theme.S(8);
+        if (img != null) { g.DrawImage(img, x, row.Y + (row.Height - img.Height) / 2); x += img.Width + Theme.S(4); }
+        var f = TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix;
+        TextRenderer.DrawText(g, e.Item.Text, lv.Font, new Rectangle(x, row.Y, n.Right - x - Theme.S(8), row.Height), Theme.Text, f);
+        if (t.Width > 0 && e.Item.SubItems.Count > 1)
+            TextRenderer.DrawText(g, e.Item.SubItems[1].Text, lv.Font, new Rectangle(t.X + Theme.S(8), row.Y, t.Width - Theme.S(8), row.Height), Theme.TextSecondary, f);
+        if (e.Item.SubItems.Count > 2)
+            TextRenderer.DrawText(g, e.Item.SubItems[2].Text, lv.Font, sz, Theme.TextSecondary, f | TextFormatFlags.Right);
+    }
+
+    void UpdateButtons()
+    {
+        int n = lv.SelectedItems.Count;
+        bDown.Enabled = bDel.Enabled = n > 0; bRen.Enabled = n == 1; bUp.Enabled = cur != "";
+    }
+
+    string IconKey(Entry e, out string type)
+    {
+        string key = e.IsDir ? "<dir>" : Path.GetExtension(e.Name).ToLowerInvariant();
+        if (!icons.Images.ContainsKey(key))
+        {
+            string t;
+            var ic = Native.TypeIcon(e.Name, e.IsDir, out t);
+            var bmp = new Bitmap(icons.ImageSize.Width, icons.ImageSize.Height);
+            if (ic != null)
+                using (var g = Graphics.FromImage(bmp))
+                    g.DrawImage(ic, Theme.S(4), (bmp.Height - ic.Height) / 2, ic.Width, ic.Height);
+            icons.Images.Add(key, bmp);
+            typeNames[key] = t;
+        }
+        type = typeNames[key];
+        return key;
+    }
+
+    List<Entry> Selected() { return lv.SelectedItems.Cast<ListViewItem>().Select(i => (Entry)i.Tag).ToList(); }
+
+    void Up()
+    {
+        if (cur == "") return;
+        int i = cur.LastIndexOf('\\');
+        cur = i < 0 ? "" : cur.Substring(0, i);
+        Reload();
+    }
+
+    void OpenSelected()
+    {
+        var sel = Selected();
+        if (sel.Count == 1 && sel[0].IsDir) { cur = Client.Join(cur, sel[0].Name); Reload(); }
+        else DownloadSelected();
+    }
+
+    void BeginRename() { if (lv.SelectedItems.Count == 1) lv.SelectedItems[0].BeginEdit(); }
+
+    protected override bool AskPin() { return PinPrompt.Ask(this, ip, pcName); }
+
+    async void Reload()
+    {
+        string dir = cur;
+        crumb.Text = pcName + (dir == "" ? "" : "  ›  " + dir.Replace("\\", "  ›  "));
+        UpdateButtons();
+        List<Entry> items;
+        try
+        {
+            while (true)
+            {
+                try { items = await Task.Run(() => Client.List(ip, dir)); break; }
+                catch (PinException) { if (IsDisposed || !AskPin()) throw; }
+            }
+        }
+        catch (Exception e)
+        {
+            if (IsDisposed) return;
+            StatusLabel.Text = L.T("Error: ", "Ошибка: ") + e.Message;
+            online = false; crumb.Invalidate();
+            return;
+        }
+        if (IsDisposed || dir != cur) return;
+        online = true; crumb.Invalidate();
+        lv.BeginUpdate(); lv.Items.Clear(); hot = null;
+        foreach (var e in items)
+        {
+            string type, key = IconKey(e, out type);
+            lv.Items.Add(new ListViewItem(new[] { e.Name, type, e.IsDir ? "" : FormatSize(e.Size) }, key) { Tag = e });
+        }
+        lv.EndUpdate();
+        UpdateButtons();
+        empty.Visible = items.Count == 0;
+        StatusLabel.Text = items.Count == 0 ? L.T("Empty folder", "Пустая папка") : L.T("Items: ", "Элементов: ") + items.Count;
+    }
+
+    async void Upload(string[] files)
+    {
+        if (files == null || files.Length == 0) return;
+        string dir = cur;
+        string what = files.Length == 1 ? Path.GetFileName(files[0].TrimEnd('\\')) : L.T("Items: ", "Объектов: ") + files.Length;
+        if (await Run(r => { foreach (var f in files) Client.Upload(ip, f, dir, r); },
+                files.Length == 1 ? L.T("Sent: ", "Отправлено: ") + what : L.T("Items sent: ", "Отправлено объектов: ") + files.Length)
+            && MainForm.Instance != null)
+            MainForm.Instance.Notify(L.T("Sent to ", "Отправлено на ") + pcName, what, null);
+        Reload();
+    }
+
+    void SendFiles()
+    {
+        using (var d = new OpenFileDialog { Multiselect = true, Title = L.T("Choose files to send to ", "Выберите файлы для отправки на ") + pcName })
+            if (d.ShowDialog(this) == DialogResult.OK) Upload(d.FileNames);
+    }
+
+    void SendFolder()
+    {
+        string p = FolderPicker.Pick(this, L.T("Choose a folder to send to ", "Выберите папку для отправки на ") + pcName, null);
+        if (p != null) Upload(new[] { p });
+    }
+
+    void Paste()
+    {
+        string[] files;
+        try { files = Clipboard.ContainsFileDropList() ? Clipboard.GetFileDropList().Cast<string>().ToArray() : null; }
+        catch (ExternalException) { StatusLabel.Text = L.T("The clipboard is used by another program", "Буфер обмена занят другой программой"); return; }
+        if (files == null) { StatusLabel.Text = L.T("No files on the clipboard", "В буфере обмена нет файлов"); return; }
+        Upload(files);
+    }
+
+    async void DownloadSelected()
+    {
+        var sel = Selected();
+        if (sel.Count == 0) { StatusLabel.Text = L.T("Select files or folders", "Выберите файлы или папки"); return; }
+        string dir = cur, root = Program.Root;
+        if (await Run(r => { foreach (var e in sel) Client.Download(ip, Client.Join(dir, e.Name), e.IsDir, root, r); },
+                L.T("Done, downloaded to ", "Готово, скачано в ") + root)
+            && MainForm.Instance != null)
+            MainForm.Instance.Notify(L.T("Downloaded from ", "Скачано с ") + pcName,
+                sel.Count == 1 ? sel[0].Name : L.T("Items: ", "Объектов: ") + sel.Count,
+                () => Process.Start("explorer.exe", "\"" + root + "\""));
+    }
+
+    async void CopySelected()
+    {
+        var sel = Selected();
+        if (sel.Count == 0) return;
+        string tmp = Path.Combine(Path.GetTempPath(), "LanFiles", Guid.NewGuid().ToString("N").Substring(0, 8));
+        Directory.CreateDirectory(tmp);
+        string dir = cur;
+        if (await Run(r => { foreach (var e in sel) Client.Download(ip, Client.Join(dir, e.Name), e.IsDir, tmp, r); },
+                L.T("Copied, paste in Explorer with Ctrl+V", "Скопировано, вставьте в Проводнике через Ctrl+V")))
+        {
+            var sc = new StringCollection();
+            sc.AddRange(Directory.GetFileSystemEntries(tmp));
+            try { Clipboard.SetFileDropList(sc); }
+            catch (ExternalException) { StatusLabel.Text = L.T("Clipboard busy, files saved to ", "Буфер обмена занят, файлы лежат в ") + tmp; }
+        }
+    }
+
+    async void DeleteSelected()
+    {
+        var sel = Selected();
+        if (sel.Count == 0) return;
+        string what = sel.Count == 1 ? "«" + sel[0].Name + "»" : sel.Count + L.T(" items", " объектов");
+        if (MessageBox.Show(this, L.T("Move ", "Удалить ") + what + L.T(" to the Recycle Bin of ", " в корзину компьютера ") + pcName + "?", L.T("Delete", "Удаление"),
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        string dir = cur;
+        await Run(r => { foreach (var e in sel) Client.Delete(ip, Client.Join(dir, e.Name)); }, L.T("Deleted", "Удалено"));
+        Reload();
+    }
+
+    static string FormatSize(long b)
+    {
+        string[] u = L.Ru ? new[] { "Б", "КБ", "МБ", "ГБ", "ТБ" } : new[] { "B", "KB", "MB", "GB", "TB" };
+        double v = b; int i = 0;
+        while (v >= 1024 && i < 4) { v /= 1024; i++; }
+        return (i == 0 ? v.ToString("0") : v.ToString("0.0")) + " " + u[i];
+    }
+}
