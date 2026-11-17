@@ -20,7 +20,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: System.Reflection.AssemblyVersion("1.4.2.0")]
+[assembly: System.Reflection.AssemblyVersion("1.4.3.0")]
 
 static class L
 {
@@ -40,9 +40,9 @@ static class Program
     public static string Pin = "";
     public const string BadPin = "Неверный пароль компьютера";
     static readonly Dictionary<string, string> known = new Dictionary<string, string>();
-    public static bool TrayOnClose = true, ExplorerMenu = true, CheckUpdates = true, ConfirmReceive;
+    public static bool TrayOnClose = true, ExplorerMenu = true, CheckUpdates = true, ConfirmReceive = true;
     static readonly List<string> favorites = new List<string>();
-    public static Func<string, string, Task<bool>> AskReceive;
+    public static Func<string, string, Func<bool>, Task<bool>> AskReceive;
 
     public class Incoming { public string Ip, Name; public long Total, Done; public TcpClient Sock; public readonly Stopwatch Clock = Stopwatch.StartNew(); }
     public static readonly List<Incoming> Incomings = new List<Incoming>();
@@ -410,7 +410,7 @@ static class Program
         string report = Path.Combine(Path.GetTempPath(), "lanfiles_selftest.txt");
         Directory.CreateDirectory(share); Directory.CreateDirectory(local); Directory.CreateDirectory(Path.Combine(src, "sub"));
         Directory.CreateDirectory(Path.Combine(src, "empty", "deeper"));
-        noDisk = true;
+        noDisk = true; ConfirmReceive = false;
         try
         {
             RememberPin("10.0.0.9", "old", false);
@@ -521,7 +521,7 @@ static class Program
             string one = Path.Combine(src, "a.txt"), big = Path.Combine(src, "sub", "big.bin");
             int asked = 0; bool answer = false;
             ConfirmReceive = true;
-            AskReceive = (i, w) => { asked++; return Task.FromResult(answer); };
+            AskReceive = (i, w, a) => { asked++; return Task.FromResult(answer); };
             Assert(Throws(() => Client.Offer(ip, "", new[] { one })) && asked == 1, "declined offer");
             Assert(Throws(() => Client.SendFile(ip, one, "d.txt", s)) && !File.Exists(Path.Combine(share2, "d.txt")), "put without approval refused");
             answer = true;
@@ -534,6 +534,16 @@ static class Program
             Assert(asked == 0 && IsFavorite(ip), "favorite is not asked");
             SetFavorite(ip, false);
             Assert(!IsFavorite(ip) && Throws(() => Client.Offer(ip, "", new[] { one })), "unstarred is asked again");
+            var promptGone = new TaskCompletionSource<bool>();
+            AskReceive = (i, w, a) => Task.Run(() =>
+            {
+                for (int k = 0; k < 100; k++) { if (!a()) { promptGone.TrySetResult(true); return false; } Thread.Sleep(50); }
+                promptGone.TrySetResult(false); return false;
+            });
+            var offerTr = new Transfer();
+            Task.Delay(300).ContinueWith(_ => offerTr.Cancel());
+            Throws(() => offerTr.Run(() => Client.Offer(ip, "", new[] { one })));
+            Assert(promptGone.Task.Wait(6000) && promptGone.Task.Result, "prompt closes when the sender cancels");
             ConfirmReceive = false; AskReceive = null;
 
             Func<string, bool> gone = n =>
@@ -790,7 +800,13 @@ static class Server
 
     static readonly Dictionary<string, DateTime> rejected = new Dictionary<string, DateTime>();
 
-    static bool Gate(string from, string what, int waitSeconds)
+    static bool Alive(Socket s)
+    {
+        try { return !(s.Poll(0, SelectMode.SelectRead) && s.Available == 0); }
+        catch (Exception) { return false; }
+    }
+
+    static bool Gate(string from, string what, int waitSeconds, Socket sock)
     {
         lock (allowed)
         {
@@ -807,7 +823,7 @@ static class Server
             if (!asking.TryGetValue(from, out ask) || ask.IsCompleted)
             {
                 var h = Program.AskReceive;
-                asking[from] = ask = h == null ? Task.FromResult(false) : h(from, what);
+                asking[from] = ask = h == null ? Task.FromResult(false) : h(from, what, () => Alive(sock));
             }
         }
         bool ok = ask.Wait(TimeSpan.FromSeconds(waitSeconds)) && ask.Result;
@@ -882,7 +898,7 @@ static class Server
                     string names = string.Join(", ", offerNames.Split('\n').Select(Program.CleanName).Where(n => n != "").Take(3));
                     if (offerCount > 3) names += ", …";
                     string what = L.T("Items: ", "Объектов: ") + offerCount + ", " + RemoteForm.FormatSize(offerSize) + "\n" + names;
-                    bool accepted = Gate(from, what, 120);
+                    bool accepted = Gate(from, what, 120, c.Client);
                     w.Write(true); w.Write(accepted); w.Flush();
                     return;
                 }
@@ -906,7 +922,7 @@ static class Server
                 }
                 else if (cmd == "MKD")
                 {
-                    if (!Gate(from, Path.GetFileName(p), 50)) throw new IOException(Declined);
+                    if (!Gate(from, Path.GetFileName(p), 50, c.Client)) throw new IOException(Declined);
                     Directory.CreateDirectory(p); w.Write(true);
                 }
                 else if (cmd == "FREE")
@@ -922,7 +938,7 @@ static class Server
                     if (Program.IsRoot(root, p)) throw new IOException(L.T("Empty file name", "Пустое имя файла"));
                     Directory.CreateDirectory(Path.GetDirectoryName(p));
                     if (new DriveInfo(Path.GetPathRoot(p)).AvailableFreeSpace < len) throw new IOException(L.T("Not enough disk space", "Недостаточно места на диске"));
-                    if (!Gate(from, Path.GetFileName(p) + ", " + RemoteForm.FormatSize(len), 50)) throw new IOException(Declined);
+                    if (!Gate(from, Path.GetFileName(p) + ", " + RemoteForm.FormatSize(len), 50, c.Client)) throw new IOException(Declined);
                     Interlocked.Increment(ref Program.Receiving);
                     var inc = new Program.Incoming { Ip = from, Name = Path.GetFileName(p), Total = len, Sock = c };
                     lock (Program.Incomings) Program.Incomings.Add(inc);
@@ -1141,12 +1157,13 @@ static class Client
             : new FileInfo(p).Length);
     }
 
-    public static void CheckSpace(string ip, string remoteDir, IEnumerable<string> paths, string pcName)
+    public static long CheckSpace(string ip, string remoteDir, IEnumerable<string> paths, string pcName)
     {
         long free = Free(ip, remoteDir), need = TotalSize(paths);
         if (free >= 0 && need > free)
             throw new NoSpaceException(L.T("Not enough space on ", "Недостаточно места на ") + pcName + "\n\n"
                 + L.T("Needed: ", "Нужно: ") + RemoteForm.FormatSize(need) + "\n" + L.T("Free: ", "Свободно: ") + RemoteForm.FormatSize(free));
+        return need;
     }
 
     public static void SendFile(string ip, string local, string rel, Action<string, int> status)
@@ -1162,11 +1179,11 @@ static class Client
         }
     }
 
-    public static void Offer(string ip, string remoteDir, ICollection<string> paths)
+    public static void Offer(string ip, string remoteDir, ICollection<string> paths, long total = -1)
     {
         using (var c = new Conn(ip, "OFFER", remoteDir == "" ? "*" : remoteDir))
         {
-            c.W.Write(paths.Count); c.W.Write(TotalSize(paths));
+            c.W.Write(paths.Count); c.W.Write(total < 0 ? TotalSize(paths) : total);
             c.W.Write(string.Join("\n", paths.Take(3).Select(p => Path.GetFileName(p.TrimEnd('\\')))));
             c.W.Flush();
             c.C.ReceiveTimeout = 150000;
@@ -1707,8 +1724,9 @@ class ProgressLine : Control
 class TransferWindow : Form
 {
     static readonly List<TransferWindow> open = new List<TransferWindow>();
-    readonly Label detail;
+    readonly Label detail, rate;
     readonly ProgressLine bar;
+    bool canceling;
 
     public TransferWindow(string title, Action cancel)
     {
@@ -1717,11 +1735,15 @@ class TransferWindow : Form
         int w = Theme.S(360), pad = Theme.S(16);
         var t = new Label { Text = title, Font = Theme.Strong, AutoEllipsis = true, Location = new Point(pad, Theme.S(14)), Size = new Size(w - 2 * pad, Theme.S(22)) };
         detail = new Label { ForeColor = Theme.TextSecondary, Font = Theme.Small, AutoEllipsis = true, Location = new Point(pad, Theme.S(38)), Size = new Size(w - 2 * pad, Theme.S(20)) };
-        bar = new ProgressLine { Location = new Point(pad, Theme.S(66)), Size = new Size(w - 2 * pad, Theme.S(3)), Value = 0 };
+        rate = new Label { ForeColor = Theme.TextSecondary, Font = Theme.Small, AutoEllipsis = true, Location = new Point(pad, Theme.S(58)), Size = new Size(w - 2 * pad, Theme.S(20)) };
+        bar = new ProgressLine { Location = new Point(pad, Theme.S(86)), Size = new Size(w - 2 * pad, Theme.S(3)), Value = 0 };
         var b = new FluentButton(L.T("Cancel", "Отмена"));
-        b.Location = new Point(w - pad - b.Width, Theme.S(81));
-        b.Click += (s, e) => { b.Enabled = false; detail.Text = L.T("Canceling…", "Отмена…"); cancel(); };
-        Controls.Add(t); Controls.Add(detail); Controls.Add(bar); Controls.Add(b);
+        b.Location = new Point(w - pad - b.Width, Theme.S(101));
+        b.Click += (s, e) => { b.Enabled = false; canceling = true; rate.Text = L.T("Canceling…", "Отмена…"); cancel(); };
+        var hide = new FluentButton(L.T("Hide", "Скрыть"), '\0', FluentButton.Kind.Subtle);
+        hide.Location = new Point(b.Left - Theme.S(8) - hide.Width, b.Top);
+        hide.Click += (s, e) => { Hide(); open.Remove(this); Arrange(); };
+        Controls.Add(t); Controls.Add(detail); Controls.Add(rate); Controls.Add(bar); Controls.Add(hide); Controls.Add(b);
         ClientSize = new Size(w, b.Bottom + Theme.S(14));
     }
 
@@ -1736,8 +1758,11 @@ class TransferWindow : Form
 
     public void Set(string text, int pct)
     {
-        if (IsDisposed) return;
-        detail.Text = Client.Line(text, pct);
+        if (IsDisposed || canceling) return;
+        int t = text.IndexOf('\t');
+        detail.Text = t < 0 ? text : text.Substring(0, t);
+        string speed = t < 0 ? "" : text.Substring(t + 1);
+        rate.Text = pct < 0 ? speed : pct + "%" + (speed == "" ? "" : "  ·  " + speed);
         bar.Value = pct;
     }
 
@@ -1892,10 +1917,10 @@ class MainForm : Form
         incomingTimer.Tick += (s, e) => ShowIncoming();
         incomingTimer.Start();
         CreateHandle();
-        Program.AskReceive = (ip, what) =>
+        Program.AskReceive = (ip, what, alive) =>
         {
             var tcs = new TaskCompletionSource<bool>();
-            try { BeginInvoke((Action)(() => AskReceive(ip, what, tcs))); }
+            try { BeginInvoke((Action)(() => AskReceive(ip, what, alive, tcs))); }
             catch (InvalidOperationException) { tcs.TrySetResult(false); }
             return tcs.Task;
         };
@@ -1965,7 +1990,7 @@ class MainForm : Form
         }
     }
 
-    void AskReceive(string ip, string what, TaskCompletionSource<bool> result)
+    void AskReceive(string ip, string what, Func<bool> alive, TaskCompletionSource<bool> result)
     {
         string name = NameOf(ip);
         var f = new Form();
@@ -1991,8 +2016,9 @@ class MainForm : Form
         bool accepted = false;
         ok.Click += (s, e) => { accepted = true; f.Close(); };
         no.Click += (s, e) => f.Close();
-        var timeout = new System.Windows.Forms.Timer { Interval = 115000 };
-        timeout.Tick += (s, e) => f.Close();
+        var clock = Stopwatch.StartNew();
+        var timeout = new System.Windows.Forms.Timer { Interval = 500 };
+        timeout.Tick += (s, e) => { if (clock.Elapsed.TotalSeconds > 115 || !alive()) f.Close(); };
         f.FormClosed += (s, e) =>
         {
             timeout.Dispose();
@@ -2214,9 +2240,9 @@ class MainForm : Form
             {
                 tr.Run(() =>
                 {
-                    Client.CheckSpace(ip, dir, paths, name);
+                    long total = Client.CheckSpace(ip, dir, paths, name);
                     report(L.T("Waiting for ", "Ждём подтверждения от ") + name + "…", -1);
-                    Client.Offer(ip, dir, paths);
+                    Client.Offer(ip, dir, paths, total);
                     foreach (var p in paths) Client.Upload(ip, p, dir, report);
                 });
                 return true;
@@ -2945,7 +2971,7 @@ class RemoteForm : BusyForm
         if (files == null || files.Length == 0) return;
         string dir = cur;
         string what = files.Length == 1 ? Path.GetFileName(files[0].TrimEnd('\\')) : L.T("Items: ", "Объектов: ") + files.Length;
-        if (await Run(r => { Client.CheckSpace(ip, dir, files, pcName); r(L.T("Waiting for ", "Ждём подтверждения от ") + pcName + "…", -1); Client.Offer(ip, dir, files); foreach (var f in files) Client.Upload(ip, f, dir, r); },
+        if (await Run(r => { long total = Client.CheckSpace(ip, dir, files, pcName); r(L.T("Waiting for ", "Ждём подтверждения от ") + pcName + "…", -1); Client.Offer(ip, dir, files, total); foreach (var f in files) Client.Upload(ip, f, dir, r); },
                 files.Length == 1 ? L.T("Sent: ", "Отправлено: ") + what : L.T("Items sent: ", "Отправлено объектов: ") + files.Length)
             && MainForm.Instance != null)
             MainForm.Instance.Notify(L.T("Sent to ", "Отправлено на ") + pcName, what, null);
