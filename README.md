@@ -36,6 +36,7 @@ Download `LanFiles.exe` (Windows) or `LanFiles.apk` (Android) from [Releases](ht
 - Browse, download and upload files, create folders.
 - Add a computer by IP for VPN or another network.
 - Favorite computers: their addresses are saved and checked again over VPN.
+- Starred computers send files without asking. On a TV, hold OK on a card to star it.
 - Choose the folder for downloads.
 - Shows the IP of the phone in Settings.
 - Updates itself from GitHub releases.
@@ -68,6 +69,7 @@ Android:
 - Просмотр, скачивание и отправка файлов, создание папок.
 - Добавление компьютера по IP для VPN или другой сети.
 - Избранные компьютеры: их адреса сохраняются и проверяются через VPN.
+- Компьютеры со звёздочкой отправляют файлы без вопроса. На ТВ звёздочка ставится долгим нажатием OK на карточке.
 - Выбор папки для загрузок.
 - IP телефона виден в настройках.
 - Обновляется сам из релизов на GitHub.

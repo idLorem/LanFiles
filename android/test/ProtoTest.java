@@ -53,6 +53,7 @@ public class ProtoTest {
         Server s = new Server(dir, new Server.Host() {
             public String pin() { return pin; }
             public boolean confirm() { return true; }
+            public boolean trusted(String from) { return false; }
             public CompletableFuture<Boolean> ask(String from, String what) { System.out.println("ASK " + from + " " + what.replace('\n', ' ')); return CompletableFuture.completedFuture(true); }
             public void progress(String from, String name, long done, long total) { }
             public void received(String from, File f) { System.out.println("RECEIVED " + f.getName() + " " + f.length()); }

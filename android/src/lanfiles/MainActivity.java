@@ -156,6 +156,7 @@ public class MainActivity extends Activity {
         server = new Server(shareDir, new Server.Host() {
             public String pin() { return prefs.getString("myPin", ""); }
             public boolean confirm() { return prefs.getBoolean("confirm", true); }
+            public boolean trusted(String from) { Peer p = peers.get(from); return p != null && favOf(p.id) != null; }
             public CompletableFuture<Boolean> ask(String from, String what) {
                 CompletableFuture<Boolean> f = new CompletableFuture<>();
                 MainActivity a = visible;
@@ -552,8 +553,14 @@ public class MainActivity extends Activity {
         boolean on = favOf(id) != null;
         return withCorner(card, on ? R.drawable.ic_star : R.drawable.ic_star_border, on ? TEXT2 : TEXT3,
             on ? L.t("Remove from favorites", "Убрать из избранного") : L.t("Add to favorites", "В избранное"),
-            () -> { setFav(ip, id, name, !on); if (!on) toast(L.t("Its address is remembered and will be checked on every search, also over VPN",
-                "Адрес запомнен и будет проверяться при каждом поиске, в том числе через VPN")); showMain(); });
+            () -> toggleFav(ip, id, name, !on));
+    }
+
+    void toggleFav(String ip, String id, String name, boolean on) {
+        setFav(ip, id, name, on);
+        if (on) toast(L.t("Its address is remembered, checked on every search (also over VPN), and it sends files without asking",
+            "Адрес запомнен, проверяется при каждом поиске (в том числе через VPN), файлы от него принимаются без вопроса"));
+        showMain();
     }
 
     void openPeer(String ip, String name) {
@@ -563,12 +570,20 @@ public class MainActivity extends Activity {
 
     void peerMenu(String ip, String name) {
         boolean manual = manualIps().contains(ip);
-        List<String> items = new ArrayList<>(Collections.singletonList(L.t("Forget password", "Забыть пароль")));
-        if (manual) items.add(L.t("Remove from list", "Убрать из списка"));
-        new AlertDialog.Builder(this).setTitle(name).setItems(items.toArray(new String[0]), (d, w) -> {
-            if (w == 0) prefs.edit().remove("pin:" + ip).apply();
-            else { List<String> m = manualIps(); m.remove(ip); saveManual(m); showMain(); }
-        }).show();
+        // The star on the card is out of reach for a remote, so the menu (long press) has it too.
+        Peer p = peers.get(ip);
+        String id = p != null ? p.id : null;
+        if (id == null) for (Fav f : favs()) if (f.ips.contains(ip)) id = f.id;
+        boolean fav = favOf(id) != null;
+        List<String> items = new ArrayList<>(); List<Runnable> acts = new ArrayList<>();
+        if (id != null) {
+            String fid = id;
+            items.add(fav ? L.t("Remove from favorites", "Убрать из избранного") : L.t("Add to favorites", "В избранное"));
+            acts.add(() -> toggleFav(ip, fid, name, !fav));
+        }
+        items.add(L.t("Forget password", "Забыть пароль")); acts.add(() -> prefs.edit().remove("pin:" + ip).apply());
+        if (manual) { items.add(L.t("Remove from list", "Убрать из списка")); acts.add(() -> { List<String> m = manualIps(); m.remove(ip); saveManual(m); showMain(); }); }
+        new AlertDialog.Builder(this).setTitle(name).setItems(items.toArray(new String[0]), (d, w) -> acts.get(w).run()).show();
     }
 
     static void saveManual(List<String> ips) {
@@ -1019,6 +1034,8 @@ public class MainActivity extends Activity {
         confirm.setPadding(0, dp(16), 0, dp(4));
         confirm.setThumbTintList(new ColorStateList(new int[][] { { android.R.attr.state_checked }, {} }, new int[] { ACCENT, TEXT2 }));
         f.addView(confirm);
+        TextView stars = text(L.t("Starred computers send without asking.", "Компьютеры со звёздочкой отправляют без вопроса."), 13, TEXT3, false);
+        f.addView(stars);
         TextView folder = text(L.t("Shared folder: Download/LanFiles. Other computers see it, and received files are saved there.",
             "Общая папка: Download/LanFiles. Её видят другие компьютеры, туда же сохраняются полученные файлы."), 13, TEXT3, false);
         folder.setPadding(0, dp(8), 0, 0);

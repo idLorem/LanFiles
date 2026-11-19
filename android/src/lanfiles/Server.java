@@ -11,6 +11,8 @@ final class Server {
     interface Host {
         String pin();
         boolean confirm();
+        /** Starred computers send without asking. */
+        boolean trusted(String from);
         /** Shows "X wants to send you files" and completes with the answer. */
         CompletableFuture<Boolean> ask(String from, String what);
         void progress(String from, String name, long done, long total);
@@ -47,7 +49,7 @@ final class Server {
     static String declined() { return L.t("The recipient declined the files", "Получатель отклонил файлы"); }
 
     boolean gate(String from, String what, int waitSeconds) {
-        if (!host.confirm()) return true;
+        if (!host.confirm() || host.trusted(from)) return true;
         CompletableFuture<Boolean> f;
         synchronized (allowed) {
             Long until = allowed.get(from);
