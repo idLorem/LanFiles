@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Diagnostics;
@@ -20,7 +20,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: System.Reflection.AssemblyVersion("1.4.4.0")]
+[assembly: System.Reflection.AssemblyVersion("1.5.0.0")]
 
 static class L
 {
@@ -1235,6 +1235,23 @@ static class Discovery
     {
         Interlocked.Exchange(ref searchUntil, DateTime.UtcNow.AddMinutes(1).Ticks);
         ThreadPool.QueueUserWorkItem(_ => Send("?", null));
+    }
+
+    /// <summary>IPv4 addresses of this PC; adapters with a gateway (the real network) come first.</summary>
+    public static string LocalIps()
+    {
+        var res = new List<string>();
+        try
+        {
+            foreach (var ni in NetworkInterface.GetAllNetworkInterfaces().OrderBy(n => n.GetIPProperties().GatewayAddresses.Count > 0 ? 0 : 1))
+            {
+                if (ni.OperationalStatus != OperationalStatus.Up || ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                foreach (var ua in ni.GetIPProperties().UnicastAddresses)
+                    if (ua.Address.AddressFamily == AddressFamily.InterNetwork && !res.Contains(ua.Address.ToString())) res.Add(ua.Address.ToString());
+            }
+        }
+        catch (NetworkInformationException) { }
+        return string.Join(", ", res);
     }
 
     static void Send(string kind, IPEndPoint to)
@@ -2479,6 +2496,9 @@ class SettingsForm : Form
 
         nameBox = new FluentTextBox(Theme.S(170)) { Value = Program.MyName };
         otherRows.Add(Row(w, '', L.T("Computer name", "Имя компьютера"), L.T("Shown to other computers", "Так его видят другие компьютеры"), nameBox, out dummy));
+        var myIp = new FluentTextBox(Theme.S(170)) { Value = Discovery.LocalIps() };
+        myIp.Box.ReadOnly = true;
+        otherRows.Add(Row(w, '', L.T("IP of this computer", "IP этого компьютера"), L.T("Enter it on a phone or PC in “Add by IP”", "Его вводят на телефоне или ПК в «Добавить по IP»"), myIp, out dummy));
         pin = new FluentTextBox(Theme.S(170)) { Value = Program.Pin };
         otherRows.Add(Row(w, '', L.T("Password of this computer", "Пароль этого компьютера"), L.T("Other PCs enter it to connect here, 4+ characters", "Его вводят другие ПК для входа сюда, от 4 символов"), pin, out dummy));
         ipBox = new FluentTextBox(Theme.S(170)) { Value = Program.ManualIp };

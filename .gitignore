@@ -3,3 +3,8 @@
 !screenshots/*.png
 *.new
 *.old
+android/build/
+*.apk
+*.keystore
+!android/res/**/*.png
+*.idsig
