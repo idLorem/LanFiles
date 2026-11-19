@@ -360,7 +360,14 @@ public class MainActivity extends Activity {
     }
 
     Drawable pressable(int fill, int stroke, float radius) {
-        return new RippleDrawable(ColorStateList.valueOf(0x22FFFFFF), round(fill, stroke, radius), round(Color.WHITE, 0, radius));
+        Drawable ripple = new RippleDrawable(ColorStateList.valueOf(0x22FFFFFF), round(fill, stroke, radius), round(Color.WHITE, 0, radius));
+        // D-pad focus (TV, keyboard): a visible accent ring.
+        GradientDrawable ring = new GradientDrawable();
+        ring.setColor(fill); ring.setCornerRadius(dp(radius)); ring.setStroke(dp(2), ACCENT);
+        StateListDrawable s = new StateListDrawable();
+        s.addState(new int[] { android.R.attr.state_focused }, ring);
+        s.addState(new int[0], ripple);
+        return s;
     }
 
     ImageView icon(int res, int color, int sizeDp) {

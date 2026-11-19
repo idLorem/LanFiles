@@ -40,6 +40,7 @@ Download `LanFiles.exe` (Windows) or `LanFiles.apk` (Android) from [Releases](ht
 - Shows the IP of the phone in Settings.
 - Updates itself from GitHub releases.
 - Receives files only while the app is open.
+- Works on Android TV: appears in the TV launcher and is controlled with the remote.
 
 The IP of a Windows PC is shown in Settings → IP of this computer.
 
@@ -71,5 +72,6 @@ Android:
 - IP телефона виден в настройках.
 - Обновляется сам из релизов на GitHub.
 - Принимает файлы, только пока приложение открыто.
+- Работает на Android TV: значок в меню ТВ, управление пультом.
 
 IP компьютера с Windows виден в «Настройки → IP этого компьютера».
