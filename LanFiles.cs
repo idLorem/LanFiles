@@ -20,7 +20,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: System.Reflection.AssemblyVersion("1.4.3.0")]
+[assembly: System.Reflection.AssemblyVersion("1.4.4.0")]
 
 static class L
 {
@@ -1224,7 +1224,17 @@ static class Discovery
         udp.Client.Bind(new IPEndPoint(IPAddress.Any, Program.UdpPort));
         udp.EnableBroadcast = true;
         new Thread(Listen) { IsBackground = true }.Start();
-        new Thread(() => { while (true) { Send("?", null); Thread.Sleep(5000); } }) { IsBackground = true }.Start();
+        Search();
+        new Thread(() => { while (true) { Thread.Sleep(5000); if (Searching) Send("?", null); } }) { IsBackground = true }.Start();
+    }
+
+    static long searchUntil;
+    public static bool Searching { get { return DateTime.UtcNow.Ticks < Interlocked.Read(ref searchUntil); } }
+
+    public static void Search()
+    {
+        Interlocked.Exchange(ref searchUntil, DateTime.UtcNow.AddMinutes(1).Ticks);
+        ThreadPool.QueueUserWorkItem(_ => Send("?", null));
     }
 
     static void Send(string kind, IPEndPoint to)
@@ -1852,6 +1862,8 @@ class MainForm : Form
     readonly Dictionary<string, List<string>> pending = new Dictionary<string, List<string>>();
     readonly FlowLayoutPanel cards;
     readonly Label hint;
+    readonly FluentButton bSearch;
+    bool searchShown = true;
     readonly NotifyIcon tray;
     readonly System.Windows.Forms.Timer batchTimer, pruneTimer, inboxTimer;
     readonly Dictionary<string, List<string>> inbox = new Dictionary<string, List<string>>();
@@ -1871,8 +1883,14 @@ class MainForm : Form
         var header = new Panel { Dock = DockStyle.Top, Height = Theme.S(76) };
         var title = new Label { Text = L.T("Computers", "Компьютеры"), Font = Theme.Title, AutoSize = true, Location = new Point(Theme.S(26), Theme.S(20)) };
         var bSettings = new FluentButton(L.T("Settings", "Настройки"), '\uE713', FluentButton.Kind.Subtle);
-        header.Controls.Add(title); header.Controls.Add(bSettings);
-        header.Resize += (s, e) => bSettings.Location = new Point(header.Width - bSettings.Width - Theme.S(20), Theme.S(24));
+        bSearch = new FluentButton(L.T("Search", "Найти"), '', FluentButton.Kind.Subtle) { Visible = false };
+        bSearch.Click += (s, e) => { Discovery.Search(); SyncSearch(); };
+        header.Controls.Add(title); header.Controls.Add(bSettings); header.Controls.Add(bSearch);
+        header.Resize += (s, e) =>
+        {
+            bSettings.Location = new Point(header.Width - bSettings.Width - Theme.S(20), Theme.S(24));
+            bSearch.Location = new Point(bSettings.Left - bSearch.Width - Theme.S(8), Theme.S(24));
+        };
 
         cards = new FlowLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(Theme.S(20), Theme.S(4), Theme.S(20), Theme.S(8)), AutoScroll = true };
         cards.HandleCreated += (s, e) => Native.SetWindowTheme(cards.Handle, "DarkMode_Explorer", null);
@@ -2087,8 +2105,17 @@ class MainForm : Form
         catch (InvalidOperationException) { }
     }
 
+    void SyncSearch()
+    {
+        bool on = Discovery.Searching;
+        bSearch.Visible = !on;
+        if (on != searchShown) { searchShown = on; Rebuild(true); }
+    }
+
     void Prune()
     {
+        SyncSearch();
+        if (!searchShown) return;
         var gone = peers.Where(p => (DateTime.Now - p.Value.Seen).TotalSeconds > 20).Select(p => p.Key).ToList();
         foreach (var ip in gone) peers.Remove(ip);
         if (gone.Count > 0) Rebuild();
@@ -2169,7 +2196,9 @@ class MainForm : Form
             cards.Controls.Add(card);
         }
         if (list.Count == 0)
-            cards.Controls.Add(new PcCard(L.T("Looking for computers…", "Поиск компьютеров…"), L.T("Run LanFiles on another computer in this network", "Запустите LanFiles на другом компьютере этой сети")) { Enabled = false });
+            cards.Controls.Add(searchShown
+                ? new PcCard(L.T("Looking for computers…", "Поиск компьютеров…"), L.T("Run LanFiles on another computer in this network", "Запустите LanFiles на другом компьютере этой сети")) { Enabled = false }
+                : new PcCard(L.T("No computers found", "Компьютеры не найдены"), L.T("Run LanFiles on another computer and click Search", "Запустите LanFiles на другом компьютере и нажмите «Найти»")) { Enabled = false });
         cards.ResumeLayout();
     }
 
