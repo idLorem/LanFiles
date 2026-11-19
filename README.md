@@ -16,6 +16,7 @@ Download `LanFiles.exe` (Windows) or `LanFiles.apk` (Android) from [Releases](ht
 - Send files by drag and drop.
 - Browse shared folders.
 - Password protection.
+- Right-click a card to show it with a computer or smartphone icon.
 - Ask before receiving.
 - Progress and speed.
 - Safe transfers.
@@ -52,6 +53,7 @@ The IP of a Windows PC is shown in Settings → IP of this computer.
 - Отправка перетаскиванием.
 - Просмотр общих папок.
 - Защита паролем.
+- Значок «Компьютер» или «Смартфон» для карточки (правый клик).
 - Подтверждение приёма.
 - Прогресс и скорость.
 - Надёжная передача.

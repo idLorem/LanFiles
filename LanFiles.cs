@@ -20,7 +20,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: System.Reflection.AssemblyVersion("1.5.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.5.1.0")]
 
 static class L
 {
@@ -69,6 +69,20 @@ static class Program
             favorites.RemoveAll(f => f == ip || f.EndsWith("@" + ip));
             if (on) favorites.Add(k);
         }
+        if (!noDisk) try { SaveSettings(); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+    }
+    static readonly List<string> phones = new List<string>();
+
+    public static string IdOf(string ip) { string id; lock (known) return ids.TryGetValue(ip, out id) ? id : null; }
+
+    static string PhoneKey(string ip) { return IdOf(ip) ?? ip; }
+
+    public static bool IsPhone(string ip) { lock (phones) return phones.Contains(PhoneKey(ip)); }
+
+    public static void SetPhone(string ip, bool on)
+    {
+        string k = PhoneKey(ip);
+        lock (phones) { phones.Remove(k); if (on) phones.Add(k); }
         if (!noDisk) try { SaveSettings(); } catch (IOException) { } catch (UnauthorizedAccessException) { }
     }
     public static string PcName = "";
@@ -142,6 +156,7 @@ static class Program
             if (l.Length > 7) CheckUpdates = l[7] != "0";
             if (l.Length > 8) ConfirmReceive = l[8] == "1";
             if (l.Length > 9) lock (favorites) favorites.AddRange(l[9].Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries));
+            if (l.Length > 10) lock (phones) phones.AddRange(l[10].Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries));
         }
         catch (IOException) { }
         LoadKnown();
@@ -233,7 +248,8 @@ static class Program
     {
         Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile));
         string fav; lock (favorites) fav = string.Join("|", favorites);
-        File.WriteAllLines(SettingsFile, new[] { string.Join("|", Roots), ManualIp, Pin, TrayOnClose ? "1" : "0", ExplorerMenu ? "1" : "0", L.Ru ? "ru" : "en", PcName, CheckUpdates ? "1" : "0", ConfirmReceive ? "1" : "0", fav });
+        string ph; lock (phones) ph = string.Join("|", phones);
+        File.WriteAllLines(SettingsFile, new[] { string.Join("|", Roots), ManualIp, Pin, TrayOnClose ? "1" : "0", ExplorerMenu ? "1" : "0", L.Ru ? "ru" : "en", PcName, CheckUpdates ? "1" : "0", ConfirmReceive ? "1" : "0", fav, ph });
     }
 
     public static bool Autostart
@@ -565,6 +581,10 @@ static class Program
             ids["10.0.0.5"] = new string('c', 32); ids["10.0.0.6"] = new string('c', 32);
             SetFavorite("10.0.0.5", true);
             Assert(IsFavorite("10.0.0.5") && !IsFavorite("10.0.0.6"), "favorite id from another IP not trusted");
+            SetPhone("10.0.0.5", true);
+            Assert(IsPhone("10.0.0.6") && !IsPhone("10.0.0.7"), "phone icon follows the device id");
+            SetPhone("10.0.0.6", false);
+            Assert(!IsPhone("10.0.0.5"), "phone icon cleared");
             using (var raw = new TcpClient(ip, TcpPort))
             {
                 var st = raw.GetStream();
@@ -1650,7 +1670,7 @@ class RoundPanel : Panel
 class PcCard : Button
 {
     public string Title, Sub;
-    public bool DropHighlight, Local, MonoSub, Favorite, CanStar;
+    public bool DropHighlight, Local, MonoSub, Favorite, CanStar, Phone;
     public static Rectangle CollapseBox { get { return new Rectangle(Theme.S(196) - Theme.S(40), Theme.S(4), Theme.S(36), Theme.S(36)); } }
     bool collapsed;
     public bool Collapsed
@@ -1690,7 +1710,7 @@ class PcCard : Button
         if (collapsed) { Theme.DrawGlyph(g, '\uE80F', new Rectangle(0, 0, Width, Height), Theme.TextSecondary, Theme.S(24)); return; }
         if (Local) Theme.DrawGlyph(g, '\uE70E', CollapseBox, Theme.TextTertiary, Theme.S(12));
         else if (CanStar && (Favorite || hover)) Theme.DrawGlyph(g, Favorite ? '\uE735' : '\uE734', CollapseBox, Favorite ? Theme.TextSecondary : Theme.TextTertiary, Theme.S(14));
-        Theme.DrawGlyph(g, Local ? '\uE80F' : '\uE977', new Rectangle(0, Theme.S(20), Width, Theme.S(60)), Enabled ? Theme.TextSecondary : Theme.TextTertiary, Theme.S(48));
+        Theme.DrawGlyph(g, Local ? '\uE80F' : Phone ? '\uE8EA' : '\uE977',new Rectangle(0, Theme.S(20), Width, Theme.S(60)), Enabled ? Theme.TextSecondary : Theme.TextTertiary, Theme.S(48));
         TextRenderer.DrawText(g, Title, Theme.Strong, new Rectangle(Theme.S(12), Theme.S(92), Width - Theme.S(24), Theme.S(24)),
             Enabled ? Theme.Text : Theme.TextSecondary, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
         var font = MonoSub ? Theme.Mono : Theme.Small;
@@ -2116,6 +2136,9 @@ class MainForm : Form
                 Peer p;
                 bool changed = !peers.TryGetValue(ip, out p) || p.Name != name;
                 peers[ip] = new Peer { Name = name, Seen = DateTime.Now };
+                // One card per device: a phone on Wi-Fi with a VPN on also reaches us from the VPN server's address.
+                string id = Program.IdOf(ip);
+                foreach (var old in peers.Keys.Where(k => k != ip && id != null && Program.IdOf(k) == id).ToList()) { peers.Remove(old); changed = true; }
                 if (changed) Rebuild();
             }));
         }
@@ -2183,7 +2206,15 @@ class MainForm : Form
         {
             string ip = kv.Key, name = kv.Value;
             bool seen = peers.ContainsKey(ip);
-            var card = new PcCard(name, ip) { AllowDrop = true, MonoSub = true, Status = seen ? 1 : 2, CanStar = true, Favorite = Program.IsFavorite(ip) };
+            var card = new PcCard(name, ip) { AllowDrop = true, MonoSub = true, Status = seen ? 1 : 2, CanStar = true, Favorite = Program.IsFavorite(ip), Phone = Program.IsPhone(ip) };
+            card.MouseUp += (s, e) =>
+            {
+                if (e.Button != MouseButtons.Right) return;
+                var m = Menus.Create();
+                Menus.Item(m, L.T("Computer icon", "Значок «Компьютер»"), '', null, (s2, e2) => { Program.SetPhone(ip, false); card.Phone = false; card.Invalidate(); }).Checked = !card.Phone;
+                Menus.Item(m, L.T("Smartphone icon", "Значок «Смартфон»"), '', null, (s2, e2) => { Program.SetPhone(ip, true); card.Phone = true; card.Invalidate(); }).Checked = card.Phone;
+                m.Show(Cursor.Position);
+            };
             card.Click += (s, e) =>
             {
                 if (PcCard.CollapseBox.Contains(card.PointToClient(Cursor.Position)))

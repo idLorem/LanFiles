@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.function.LongFunction;
 import java.util.function.Supplier;
 
 /** UDP discovery, same messages as the Windows version: LANFILES|id|name|? or !. */
@@ -11,7 +12,8 @@ final class Discovery {
     interface Found { void on(String ip, String id, String name); }
 
     static volatile Found found;
-    static volatile List<String> extra = Collections.emptyList();
+    /** Unicast targets for computers not heard from since the given time. */
+    static volatile LongFunction<List<String>> extra = since -> Collections.emptyList();
     static volatile long searchUntil;
     static String myId;
     static Supplier<String> myName;
@@ -46,18 +48,25 @@ final class Discovery {
 
     static void send(String kind, InetAddress to) {
         byte[] msg = ("LANFILES|" + myId + "|" + L.cleanName(myName.get()) + "|" + kind).getBytes(StandardCharsets.UTF_8);
+        if (to != null) { sendTo(msg, Collections.singletonList(to)); return; }
+        long start = System.currentTimeMillis();
         List<InetAddress> targets = new ArrayList<>();
-        if (to != null) targets.add(to);
-        else {
-            try {
-                targets.add(InetAddress.getByName("255.255.255.255"));
-                for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
-                    if (!ni.isUp() || ni.isLoopback()) continue;
-                    for (InterfaceAddress a : ni.getInterfaceAddresses()) if (a.getBroadcast() != null) targets.add(a.getBroadcast());
-                }
-            } catch (IOException ignored) { }
-            for (String ip : extra) try { targets.add(InetAddress.getByName(ip)); } catch (IOException ignored) { }
-        }
+        try {
+            targets.add(InetAddress.getByName("255.255.255.255"));
+            for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                if (!ni.isUp() || ni.isLoopback()) continue;
+                for (InterfaceAddress a : ni.getInterfaceAddresses()) if (a.getBroadcast() != null) targets.add(a.getBroadcast());
+            }
+        } catch (IOException ignored) { }
+        sendTo(msg, targets);
+        // Unicast goes only to computers that did not answer the broadcast: on Wi-Fi with a VPN on, it would reach the PC a second time from the VPN server's address.
+        try { Thread.sleep(1500); } catch (InterruptedException e) { return; }
+        targets.clear();
+        for (String ip : extra.apply(start)) try { targets.add(InetAddress.getByName(ip)); } catch (IOException ignored) { }
+        sendTo(msg, targets);
+    }
+
+    static void sendTo(byte[] msg, List<InetAddress> targets) {
         for (InetAddress t : targets) {
             try { udp.send(new DatagramPacket(msg, msg.length, t, Net.UDP)); } catch (IOException ignored) { }
         }

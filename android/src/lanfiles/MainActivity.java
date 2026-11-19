@@ -174,7 +174,7 @@ public class MainActivity extends Activity {
         new Thread(() -> {
             try { server.start(Net.TCP); } catch (IOException ignored) { }
             try {
-                Discovery.extra = probeIps();
+                Discovery.extra = MainActivity::probeIps;
                 Discovery.found = (ip, id, name) -> {
                     Peer p = new Peer(); p.id = id; p.name = name; p.seen = System.currentTimeMillis();
                     peers.put(ip, p);
@@ -240,7 +240,6 @@ public class MainActivity extends Activity {
         List<String> lines = new ArrayList<>();
         for (Fav f : l) lines.add(f.line());
         prefs.edit().putString("favs", TextUtils.join("\n", lines)).apply();
-        Discovery.extra = probeIps();
     }
 
     static Fav favOf(String id) {
@@ -271,9 +270,14 @@ public class MainActivity extends Activity {
         saveFavs(l);
     }
 
-    static List<String> probeIps() {
-        List<String> res = manualIps();
-        for (Fav f : favs()) for (String ip : f.ips) if (!res.contains(ip)) res.add(ip);
+    /** Manual and favorite addresses of computers not heard from since the given time. */
+    static List<String> probeIps(long since) {
+        Set<String> heardIds = new HashSet<>(), heardIps = new HashSet<>();
+        for (Map.Entry<String, Peer> e : peers.entrySet())
+            if (e.getValue().seen >= since) { heardIds.add(e.getValue().id); heardIps.add(e.getKey()); }
+        List<String> res = new ArrayList<>();
+        for (String ip : manualIps()) if (!heardIps.contains(ip)) res.add(ip);
+        for (Fav f : favs()) if (!heardIds.contains(f.id)) for (String ip : f.ips) if (!res.contains(ip)) res.add(ip);
         return res;
     }
 
@@ -562,7 +566,6 @@ public class MainActivity extends Activity {
 
     static void saveManual(List<String> ips) {
         prefs.edit().putString("manual", TextUtils.join("\n", ips)).apply();
-        Discovery.extra = probeIps();
     }
 
     EditText input(String value, String hint, boolean password) {
