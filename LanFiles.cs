@@ -20,7 +20,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: System.Reflection.AssemblyVersion("1.5.5.0")]
+[assembly: System.Reflection.AssemblyVersion("1.5.6.0")]
 
 static class L
 {

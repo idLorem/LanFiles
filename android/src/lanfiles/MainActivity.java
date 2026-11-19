@@ -337,6 +337,10 @@ public class MainActivity extends Activity {
             int i = remoteDir.lastIndexOf('\\');
             remoteDir = i < 0 ? "" : remoteDir.substring(0, i);
             loadRemote();
+        } else if (screen.equals("downloads") && !dlSub.isEmpty()) {
+            int i = dlSub.lastIndexOf('/');
+            dlSub = i < 0 ? "" : dlSub.substring(0, i);
+            showDownloads();
         } else if (!screen.equals("main")) showMain();
         else if (sharing != null) { sharing = null; showMain(); }
         else super.onBackPressed();
@@ -439,6 +443,7 @@ public class MainActivity extends Activity {
         TextView title = text(sharing != null ? L.t("Send to…", "Куда отправить?") : L.t("Computers", "Компьютеры"), 28, TEXT, true);
         header.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
         header.addView(iconButton(R.drawable.ic_refresh, L.t("Search again", "Искать заново"), v -> { Discovery.search(); showMain(); }));
+        if (sharing == null) header.addView(iconButton(R.drawable.ic_folder, L.t("Downloads", "Загрузки"), v -> { dlSub = ""; showDownloads(); }));
         if (sharing == null) header.addView(iconButton(R.drawable.ic_settings, L.t("Settings", "Настройки"), v -> showSettings()));
         p.addView(header);
 
@@ -713,6 +718,76 @@ public class MainActivity extends Activity {
         list.setOnItemLongClickListener((a, v, i, id) -> { entryMenu(items.get(i)); return true; });
     }
 
+    // ---------- downloaded files ----------
+
+    String dlSub = "";
+
+    /** Files in the downloads folder, newest first; tap opens a file in another app. Shown after a transfer, since a file manager is far away on a TV. */
+    void showDownloads() {
+        screen = "downloads";
+        LinearLayout p = page();
+        LinearLayout top = new LinearLayout(this);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+        top.addView(iconButton(R.drawable.ic_back, L.t("Back", "Назад"), v -> onBackPressed()));
+        TextView title = text(L.t("Downloads", "Загрузки"), 20, TEXT, true);
+        title.setPadding(dp(4), 0, 0, 0);
+        top.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+        top.addView(iconButton(R.drawable.ic_refresh, L.t("Refresh", "Обновить"), v -> showDownloads()));
+        p.addView(top);
+
+        File dir = dlSub.isEmpty() ? downloadDir() : new File(downloadDir(), dlSub);
+        List<File> items = new ArrayList<>();
+        File[] all = dir.listFiles();
+        if (all != null) for (File f : all) if (!f.getName().startsWith(".")) items.add(f);
+        items.sort((a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+        status = text(pretty(dir) + "    ·    " + (items.isEmpty() ? L.t("No files yet", "Файлов пока нет") : L.t("Items: ", "Объектов: ") + items.size()), 13, TEXT3, false);
+        status.setPadding(dp(4), dp(8), dp(4), dp(8));
+        p.addView(status);
+        list = new ListView(this);
+        list.setDivider(null);
+        list.setSelector(new ColorDrawable(0x22FFFFFF));
+        p.addView(list, new LinearLayout.LayoutParams(-1, 0, 1));
+        list.setAdapter(new BaseAdapter() {
+            public int getCount() { return items.size(); }
+            public Object getItem(int i) { return items.get(i); }
+            public long getItemId(int i) { return i; }
+            public View getView(int i, View old, ViewGroup parent) {
+                File f = items.get(i);
+                LinearLayout row = new LinearLayout(MainActivity.this);
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                row.setPadding(dp(8), 0, dp(8), 0);
+                row.setMinimumHeight(dp(52));
+                row.addView(icon(f.isDirectory() ? R.drawable.ic_folder : R.drawable.ic_file, f.isDirectory() ? FOLDER : TEXT2, 24));
+                TextView n = text(f.getName(), 15, TEXT, false);
+                n.setSingleLine(); n.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+                n.setPadding(dp(14), 0, dp(8), 0);
+                row.addView(n, new LinearLayout.LayoutParams(0, -2, 1));
+                if (!f.isDirectory()) row.addView(text(L.size(f.length()), 13, TEXT3, false));
+                return row;
+            }
+        });
+        list.post(list::requestFocus); // a remote starts on the first file, not on the Back button
+        list.setOnItemClickListener((a, v, i, id) -> {
+            File f = items.get(i);
+            if (f.isDirectory()) { dlSub = dlSub.isEmpty() ? f.getName() : dlSub + "/" + f.getName(); showDownloads(); }
+            else openFile(f);
+        });
+    }
+
+    void showDownloadsAfterTransfer() {
+        if (isFinishing() || screen.equals("settings")) return;
+        dlSub = "";
+        showDownloads();
+    }
+
+    void openFile(File f) {
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW).setDataAndType(FilesProvider.uri(f), FilesProvider.mime(f)).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION));
+        } catch (ActivityNotFoundException e) {
+            toast(L.t("No app can open this file", "Нет приложения, которое откроет этот файл"));
+        }
+    }
+
     void entryMenu(Net.Entry e) {
         String rel = Net.join(remoteDir, e.name), ip = remoteIp;
         new AlertDialog.Builder(this).setTitle(e.name).setItems(new String[] {
@@ -836,6 +911,7 @@ public class MainActivity extends Activity {
             card.close();
             incoming.remove(from);
             toast(L.t("Saved to Download/LanFiles", "Сохранено в Download/LanFiles"));
+            showDownloadsAfterTransfer();
         }, card, SystemClock.uptimeMillis() + 3000);
     }
 
@@ -984,7 +1060,7 @@ public class MainActivity extends Activity {
                 dir.mkdirs();
                 File f = Net.download(ip, rel, e.dir, dir, (n, d, t) -> ui.post(() -> card.set(n, d, t)), cancel);
                 MediaScannerConnection.scanFile(getApplicationContext(), new String[] { f.getPath() }, null, null);
-                ui.post(() -> toast(L.t("Saved: ", "Сохранено: ") + pretty(f)));
+                ui.post(() -> { toast(L.t("Saved: ", "Сохранено: ") + pretty(f)); showDownloadsAfterTransfer(); });
             } catch (Net.PinException x) {
                 ui.post(() -> askPin(ip, name, () -> download(e)));
             } catch (Net.Canceled x) {
