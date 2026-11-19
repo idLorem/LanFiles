@@ -20,7 +20,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: System.Reflection.AssemblyVersion("1.5.2.0")]
+[assembly: System.Reflection.AssemblyVersion("1.5.3.0")]
 
 static class L
 {
@@ -1483,7 +1483,7 @@ class DarkRenderer : ToolStripProfessionalRenderer
 
     protected override void OnRenderItemImage(ToolStripItemImageRenderEventArgs e)
     {
-        var r = e.ImageRectangle; r.Offset(Theme.S(4), 0);
+        var r = e.ImageRectangle; r.Offset(Theme.S(4), 0); r.Y = (e.Item.Height - r.Height) / 2;
         if (e.Image != null) e.Graphics.DrawImage(e.Image, r);
     }
 
@@ -1500,6 +1500,8 @@ class DarkRenderer : ToolStripProfessionalRenderer
         var mi = e.Item as ToolStripMenuItem;
         bool shortcut = mi != null && e.Text == mi.ShortcutKeyDisplayString;
         e.TextColor = !e.Item.Enabled ? Theme.TextTertiary : shortcut ? Theme.TextTertiary : Theme.Text;
+        var t = e.TextRectangle; e.TextRectangle = new Rectangle(t.X, -Theme.S(1), t.Width, e.Item.Height); // line box includes descent, so caps sit low
+        e.TextFormat = (e.TextFormat & ~(TextFormatFlags.Top | TextFormatFlags.Bottom)) | TextFormatFlags.VerticalCenter;
         base.OnRenderItemText(e);
     }
 
