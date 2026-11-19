@@ -20,7 +20,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: System.Reflection.AssemblyVersion("1.5.1.0")]
+[assembly: System.Reflection.AssemblyVersion("1.5.2.0")]
 
 static class L
 {
@@ -1235,7 +1235,7 @@ static class Discovery
 {
     static readonly string myId = Program.MachineId();
     static UdpClient udp;
-    public static event Action<string, string> Found;
+    public static event Action<string, string, bool> Found;
 
     public static void Start()
     {
@@ -1243,6 +1243,7 @@ static class Discovery
         udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         udp.Client.Bind(new IPEndPoint(IPAddress.Any, Program.UdpPort));
         udp.EnableBroadcast = true;
+        udp.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.PacketInformation, true);
         new Thread(Listen) { IsBackground = true }.Start();
         Search();
         new Thread(() => { while (true) { Thread.Sleep(5000); if (Searching) Send("?", null); } }) { IsBackground = true }.Start();
@@ -1297,19 +1298,30 @@ static class Discovery
         foreach (var t in targets) { try { udp.Send(msg, msg.Length, t); } catch (SocketException) { } }
     }
 
+    static bool IsMine(IPAddress a)
+    {
+        try { return NetworkInterface.GetAllNetworkInterfaces().Any(ni => ni.GetIPProperties().UnicastAddresses.Any(u => u.Address.Equals(a))); }
+        catch (NetworkInformationException) { return true; }
+    }
+
     static void Listen()
     {
+        var buf = new byte[2048];
         while (true)
         {
-            var ep = new IPEndPoint(IPAddress.Any, 0);
-            byte[] b;
-            try { b = udp.Receive(ref ep); } catch (SocketException) { continue; }
-            var p = Encoding.UTF8.GetString(b).Split('|');
+            EndPoint from = new IPEndPoint(IPAddress.Any, 0);
+            var flags = SocketFlags.None;
+            IPPacketInformation info;
+            int n;
+            try { n = udp.Client.ReceiveMessageFrom(buf, 0, buf.Length, ref flags, ref from, out info); } catch (SocketException) { continue; }
+            var ep = (IPEndPoint)from;
+            var p = Encoding.UTF8.GetString(buf, 0, n).Split('|');
             if (p.Length != 4 || p[0] != "LANFILES" || p[1] == myId) continue;
             if (p[3] == "?") Send("!", new IPEndPoint(ep.Address, Program.UdpPort));
             Program.SeenPeer(ep.Address.ToString(), p[1]);
             string name = Program.CleanName(p[2]);
-            var h = Found; if (h != null) h(ep.Address.ToString(), name == "" ? ep.Address.ToString() : name);
+            // A broadcast never passes through a VPN server, so its sender address is the device itself.
+            var h = Found; if (h != null) h(ep.Address.ToString(), name == "" ? ep.Address.ToString() : name, !IsMine(info.Address));
         }
     }
 }
@@ -1460,16 +1472,26 @@ class DarkRenderer : ToolStripProfessionalRenderer
 
     protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
     {
-        using (var p = new Pen(Theme.Stroke)) e.Graphics.DrawRectangle(p, 0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1);
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        using (var p = new Pen(Theme.Stroke)) using (var path = Theme.Round(new Rectangle(0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1), Theme.S(8))) e.Graphics.DrawPath(p, path);
     }
 
+    // Items can be laid out wider than the drop-down itself, so highlights use the strip's width.
+    static int Inner(ToolStripItemRenderEventArgs e) { return e.ToolStrip.Width - e.Item.Bounds.X; }
+
     protected override void OnRenderImageMargin(ToolStripRenderEventArgs e) { }
+
+    protected override void OnRenderItemImage(ToolStripItemImageRenderEventArgs e)
+    {
+        var r = e.ImageRectangle; r.Offset(Theme.S(4), 0);
+        if (e.Image != null) e.Graphics.DrawImage(e.Image, r);
+    }
 
     protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
     {
         if (!e.Item.Selected || !e.Item.Enabled) return;
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        var r = new Rectangle(Theme.S(3), 0, e.Item.Width - Theme.S(6), e.Item.Height - 1);
+        var r = new Rectangle(Theme.S(4), 0, Inner(e) - Theme.S(8), e.Item.Height - 1);
         using (var path = Theme.Round(r, Theme.S(4))) using (var b = new SolidBrush(Theme.MenuHover)) e.Graphics.FillPath(b, path);
     }
 
@@ -1484,7 +1506,7 @@ class DarkRenderer : ToolStripProfessionalRenderer
     protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
     {
         int y = e.Item.Height / 2;
-        using (var p = new Pen(Theme.Stroke)) e.Graphics.DrawLine(p, Theme.S(4), y, e.Item.Width - Theme.S(4), y);
+        using (var p = new Pen(Theme.Stroke)) e.Graphics.DrawLine(p, Theme.S(12), y, Inner(e) - Theme.S(12), y);
     }
 
     protected override void OnRenderArrow(ToolStripArrowRenderEventArgs e) { e.ArrowColor = Theme.Text; base.OnRenderArrow(e); }
@@ -1891,7 +1913,7 @@ class BusyForm : Form
 
 class MainForm : Form
 {
-    class Peer { public string Name; public DateTime Seen; }
+    class Peer { public string Name; public DateTime Seen; public bool Broadcast; }
 
     readonly Dictionary<string, Peer> peers = new Dictionary<string, Peer>();
     bool localOpen;
@@ -2126,18 +2148,21 @@ class MainForm : Form
         if (L.Ru != ru) { Program.RestartAfterExit = true; ExitApp(); }
     }
 
-    void OnFound(string ip, string name)
+    void OnFound(string ip, string name, bool broadcast)
     {
         if (IsDisposed) return;
         try
         {
             BeginInvoke((Action)(() =>
             {
+                // One card per device: a phone on Wi-Fi with a VPN on also answers from the VPN server's address,
+                // which can't reach the phone, so the address it broadcast from wins.
+                string id = Program.IdOf(ip);
+                string twin = id == null ? null : peers.Keys.FirstOrDefault(k => k != ip && peers[k].Broadcast && Program.IdOf(k) == id);
+                if (!broadcast && twin != null) { peers[twin].Seen = DateTime.Now; return; }
                 Peer p;
                 bool changed = !peers.TryGetValue(ip, out p) || p.Name != name;
-                peers[ip] = new Peer { Name = name, Seen = DateTime.Now };
-                // One card per device: a phone on Wi-Fi with a VPN on also reaches us from the VPN server's address.
-                string id = Program.IdOf(ip);
+                peers[ip] = new Peer { Name = name, Seen = DateTime.Now, Broadcast = broadcast || (p != null && p.Broadcast) };
                 foreach (var old in peers.Keys.Where(k => k != ip && id != null && Program.IdOf(k) == id).ToList()) { peers.Remove(old); changed = true; }
                 if (changed) Rebuild();
             }));
@@ -2511,7 +2536,7 @@ class SettingsForm : Form
         StartPosition = firstRun ? FormStartPosition.CenterScreen : FormStartPosition.CenterParent;
         ShowInTaskbar = firstRun;
 
-        flow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true, Padding = new Padding(Theme.S(20), Theme.S(16), Theme.S(20), Theme.S(8)) };
+        flow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true, Padding = new Padding(Theme.S(20), Theme.S(firstRun ? 16 : 8), Theme.S(20), Theme.S(8)) };
         flow.HandleCreated += (s, e) => Native.SetWindowTheme(flow.Handle, "DarkMode_Explorer", null);
         title = new Label { Text = firstRun ? L.T("Welcome", "Добро пожаловать") : L.T("Settings", "Настройки"), Font = Theme.Title, AutoSize = true, Margin = new Padding(0, 0, 0, Theme.S(12)) };
         Label dummy;
@@ -2593,7 +2618,7 @@ class SettingsForm : Form
         flow.Controls.Clear();
         foreach (var c in folderRows) c.Dispose();
         folderRows.Clear();
-        flow.Controls.Add(title);
+        if (firstRun) flow.Controls.Add(title); // the window caption already says "Settings"
         flow.Controls.Add(foldersHeader);
         for (int i = 0; i < folders.Count; i++)
         {
@@ -2622,19 +2647,21 @@ class SettingsForm : Form
 
     static Control Section(int width, string text, Control right)
     {
-        var p = new Panel { Size = new Size(width, Theme.S(40)), Margin = new Padding(0, Theme.S(12), 0, Theme.S(4)) };
-        p.Controls.Add(new Label { Text = text, Font = Theme.Strong, AutoSize = true, Location = new Point(Theme.S(4), Theme.S(12)) });
+        var p = new Panel { Size = new Size(width, Theme.S(32)), Margin = new Padding(0, Theme.S(12), 0, Theme.S(4)) };
+        var l = new Label { Text = text, Font = Theme.Strong, AutoSize = true };
+        l.Location = new Point(Theme.S(4), (p.Height - l.PreferredHeight) / 2);
+        p.Controls.Add(l);
         if (right != null) { right.Location = new Point(width - right.Width, (p.Height - right.Height) / 2); p.Controls.Add(right); }
         return p;
     }
 
     static Control Row(int width, char glyph, string title, string sub, Control right, out Label subLabel)
     {
-        int h = Theme.S(60);
+        int h = Theme.S(56);
         var p = new RoundPanel { Glyph = glyph, Size = new Size(width, h), Margin = new Padding(0, 0, 0, Theme.S(4)) };
         int x = Theme.S(56), tw = width - x - right.Width - Theme.S(32);
-        var t = new Label { Text = title, Location = new Point(x, Theme.S(10)), Size = new Size(tw, Theme.S(22)), BackColor = Theme.Layer, ForeColor = Theme.Text, AutoEllipsis = true };
-        subLabel = new Label { Text = sub, Location = new Point(x, Theme.S(32)), Size = new Size(tw, Theme.S(20)), BackColor = Theme.Layer, ForeColor = Theme.TextSecondary, Font = Theme.Small, AutoEllipsis = true };
+        var t = new Label { Text = title, Location = new Point(x, Theme.S(8)), Size = new Size(tw, Theme.S(22)), BackColor = Theme.Layer, ForeColor = Theme.Text, AutoEllipsis = true };
+        subLabel = new Label { Text = sub, Location = new Point(x, Theme.S(28)),Size = new Size(tw, Theme.S(20)), BackColor = Theme.Layer, ForeColor = Theme.TextSecondary, Font = Theme.Small, AutoEllipsis = true };
         right.Location = new Point(width - right.Width - Theme.S(16), (h - right.Height) / 2);
         p.Controls.Add(t); p.Controls.Add(subLabel); p.Controls.Add(right);
         return p;
