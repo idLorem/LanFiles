@@ -32,7 +32,7 @@ import java.util.concurrent.*;
 public class MainActivity extends Activity {
     static final int BG = 0xFF202020, LAYER = 0xFF2B2B2B, STROKE = 0xFF373737, INPUT = 0xFF323232,
         TEXT = 0xFFFFFFFF, TEXT2 = 0xFFCECECE, TEXT3 = 0xFF8C8C8C, ONLINE = 0xFF6CCB5F, ACCENT = 0xFF60CDFF, FOLDER = 0xFFF8D775;
-    static final int REQ_PICK = 1, REQ_PERM = 2, REQ_DIR = 3;
+    static final int REQ_PICK = 1, REQ_PERM = 2, REQ_DIR = 3, REQ_NOTIF = 4;
 
     static class Peer { String id, name; long seen; }
 
@@ -73,6 +73,9 @@ public class MainActivity extends Activity {
         init(getApplicationContext());
         if (Build.VERSION.SDK_INT <= 29 && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED)
             requestPermissions(new String[] { Manifest.permission.WRITE_EXTERNAL_STORAGE }, REQ_PERM);
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+            requestPermissions(new String[] { Manifest.permission.POST_NOTIFICATIONS }, REQ_NOTIF);
+        ReceiveService.sync(this);
         handleInstall(getIntent());
         handleShare(getIntent());
         showMain();
@@ -160,8 +163,12 @@ public class MainActivity extends Activity {
             public CompletableFuture<Boolean> ask(String from, String what) {
                 CompletableFuture<Boolean> f = new CompletableFuture<>();
                 MainActivity a = visible;
-                if (a == null) f.complete(false);
-                else a.ui.post(() -> a.askReceive(from, what, f));
+                if (a != null) { a.ui.post(() -> a.askReceive(from, what, f)); return f; }
+                // App is in the background: notify, and show the dialog when the user opens it.
+                Peer p = peers.get(from);
+                pendingAsk = new Object[] { p != null ? p.name : from, what, f };
+                ReceiveService.ask(ctx, (String) pendingAsk[0], what);
+                new Handler(Looper.getMainLooper()).postDelayed(() -> { f.complete(false); ReceiveService.cancelAsk(ctx); }, 115000);
                 return f;
             }
             public void progress(String from, String name, long done, long total) {
@@ -170,6 +177,7 @@ public class MainActivity extends Activity {
             }
             public void received(String from, File f) {
                 MediaScannerConnection.scanFile(ctx, new String[] { f.getPath() }, null, null);
+                if (visible == null) ReceiveService.done(ctx, f.getName());
             }
         });
         new Thread(() -> {
@@ -313,7 +321,17 @@ public class MainActivity extends Activity {
         if (screen.equals("main") && !mainState().equals(mainShown)) showMain();
     }
 
-    @Override protected void onResume() { super.onResume(); visible = this; ui.post(tick); }
+    static volatile Object[] pendingAsk;
+
+    @Override protected void onResume() {
+        super.onResume(); visible = this; ui.post(tick);
+        Object[] p = pendingAsk; pendingAsk = null;
+        if (p != null) {
+            @SuppressWarnings("unchecked") CompletableFuture<Boolean> f = (CompletableFuture<Boolean>) p[2];
+            ReceiveService.cancelAsk(this);
+            if (!f.isDone()) askReceive((String) p[0], (String) p[1], f);
+        }
+    }
     @Override protected void onPause() { super.onPause(); visible = null; ui.removeCallbacks(tick); }
     @Override protected void onNewIntent(Intent i) { super.onNewIntent(i); handleInstall(i); handleShare(i); if (sharing != null) showMain(); }
 
@@ -1110,6 +1128,13 @@ public class MainActivity extends Activity {
         confirm.setPadding(0, dp(16), 0, dp(4));
         confirm.setThumbTintList(new ColorStateList(new int[][] { { android.R.attr.state_checked }, {} }, new int[] { ACCENT, TEXT2 }));
         f.addView(confirm);
+        Switch bg = new Switch(this);
+        bg.setText(L.t("Receive when the app is closed", "Принимать, когда приложение закрыто"));
+        bg.setTextColor(TEXT); bg.setTextSize(15);
+        bg.setChecked(prefs.getBoolean("background", true));
+        bg.setPadding(0, dp(8), 0, dp(4));
+        bg.setThumbTintList(confirm.getThumbTintList());
+        f.addView(bg);
         TextView stars = text(L.t("Starred computers send without asking.", "Компьютеры со звёздочкой отправляют без вопроса."), 13, TEXT3, false);
         f.addView(stars);
         TextView folder = text(L.t("Shared folder: Download/LanFiles. Other computers see it, and received files are saved there.",
@@ -1157,7 +1182,8 @@ public class MainActivity extends Activity {
 
         View save = pillButton(0, L.t("Save", "Сохранить"), true, v -> {
             prefs.edit().putString("name", L.cleanName(name.getText().toString())).putString("myPin", pin.getText().toString())
-                .putBoolean("confirm", confirm.isChecked()).putBoolean("checkUpdates", upd.isChecked()).apply();
+                .putBoolean("confirm", confirm.isChecked()).putBoolean("background", bg.isChecked()).putBoolean("checkUpdates", upd.isChecked()).apply();
+            ReceiveService.sync(this);
             List<String> list = new ArrayList<>();
             for (String s : ips.getText().toString().split("[\\s,;]+")) if (!s.isEmpty() && !list.contains(s)) list.add(s);
             saveManual(list);
