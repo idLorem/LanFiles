@@ -20,7 +20,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: System.Reflection.AssemblyVersion("1.6.2.0")]
+[assembly: System.Reflection.AssemblyVersion("1.6.3.0")]
 
 static class L
 {
@@ -513,6 +513,7 @@ static class Program
 
             var list = Client.List(ip, "");
             Assert(list.Any(e => e.Name == "src" && e.IsDir) && list.Any(e => e.Name == "a.txt" && e.Size > 0), "list");
+            Assert(list.All(e => e.Created > 0), "list has creation dates");
 
             Client.Download(ip, "src", true, local, s);
             Assert(File.ReadAllBytes(Path.Combine(local, "src", "sub", "big.bin")).SequenceEqual(data), "download content");
@@ -992,19 +993,20 @@ static class Server
                 string root, p = Program.Resolve(roots, rel, out root);
                 if (root == null)
                 {
-                    if (cmd != "LIST") throw new IOException(L.T("Open one of the shared folders first", "Сначала откройте одну из общих папок"));
+                    if (cmd != "LIST" && cmd != "LIST2") throw new IOException(L.T("Open one of the shared folders first", "Сначала откройте одну из общих папок"));
                     var al = Program.Aliases(roots);
                     var live = Enumerable.Range(0, roots.Count).Where(i => Directory.Exists(roots[i])).ToList();
                     w.Write(true); w.Write(live.Count);
-                    foreach (int i in live) { w.Write(al[i]); w.Write(true); w.Write(0L); }
+                    foreach (int i in live) { w.Write(al[i]); w.Write(true); w.Write(0L); if (cmd == "LIST2") w.Write(0L); }
                 }
-                else if (cmd == "LIST")
+                else if (cmd == "LIST" || cmd == "LIST2")
                 {
+                    bool withDate = cmd == "LIST2";
                     var di = new DirectoryInfo(p);
                     var dirs = di.GetDirectories(); var files = di.GetFiles();
                     w.Write(true); w.Write(dirs.Length + files.Length);
-                    foreach (var d in dirs) { w.Write(d.Name); w.Write(true); w.Write(0L); }
-                    foreach (var f in files) { w.Write(f.Name); w.Write(false); w.Write(f.Length); }
+                    foreach (var d in dirs) { w.Write(d.Name); w.Write(true); w.Write(0L); if (withDate) w.Write(d.CreationTimeUtc.Ticks); }
+                    foreach (var f in files) { w.Write(f.Name); w.Write(false); w.Write(f.Length); if (withDate) w.Write(f.CreationTimeUtc.Ticks); }
                 }
                 else if (cmd == "MKD")
                 {
@@ -1079,7 +1081,7 @@ static class Server
     }
 }
 
-class Entry { public string Name; public bool IsDir; public long Size; }
+class Entry { public string Name; public bool IsDir; public long Size, Created; } // Created: UTC ticks, 0 = unknown
 
 class SafeReader : BinaryReader
 {
@@ -1183,15 +1185,29 @@ static class Client
         return (pct >= 0 ? s + " — " + pct + "%" : s) + speed;
     }
 
+    static readonly HashSet<string> noDates = new HashSet<string>(); // computers that only know LIST (older versions, Android)
+
     public static List<Entry> List(string ip, string rel)
     {
-        using (var c = new Conn(ip, "LIST", rel))
+        bool old; lock (noDates) old = noDates.Contains(ip);
+        if (!old)
+        {
+            try { return ReadList(ip, rel, true); }
+            catch (PinException) { throw; }
+            catch (IOException) { lock (noDates) noDates.Add(ip); } // unknown command, or a real error that the plain LIST will report again
+        }
+        return ReadList(ip, rel, false);
+    }
+
+    static List<Entry> ReadList(string ip, string rel, bool dates)
+    {
+        using (var c = new Conn(ip, dates ? "LIST2" : "LIST", rel))
         {
             c.CheckOk();
             int n = c.R.ReadInt32();
             var res = new List<Entry>();
             for (int i = 0; i < n; i++)
-                res.Add(new Entry { Name = c.R.ReadString(), IsDir = c.R.ReadBoolean(), Size = c.R.ReadInt64() });
+                res.Add(new Entry { Name = c.R.ReadString(), IsDir = c.R.ReadBoolean(), Size = c.R.ReadInt64(), Created = dates ? c.R.ReadInt64() : 0 });
             return res;
         }
     }
@@ -2429,10 +2445,12 @@ class MainForm : Form
     void OpenRemote(string ip, string name)
     {
         RemoteForm f;
-        if (remotes.TryGetValue(ip, out f) && !f.IsDisposed) { f.WindowState = FormWindowState.Normal; f.Activate(); return; }
+        if (remotes.TryGetValue(ip, out f) && !f.IsDisposed) { f.WindowState = FormWindowState.Normal; f.Activate(); Hide(); return; }
         f = new RemoteForm(ip, name);
         remotes[ip] = f;
+        if (WindowState == FormWindowState.Normal) { f.StartPosition = FormStartPosition.Manual; f.Location = Location; } // opens where Computers was
         f.Show();
+        Hide();
     }
 
     public void OnPipe(string line)
@@ -3049,16 +3067,18 @@ class RemoteForm : BusyForm
         var tip = Theme.MakeTip();
 
         var bar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = Theme.S(52), Padding = new Padding(Theme.S(12), Theme.S(10), Theme.S(12), 0), WrapContents = false };
+        var bBack = new FluentButton(L.T("Computers", "Компьютеры"), '\uE72B', FluentButton.Kind.Subtle);
         bUp = new FluentButton("", '\uE74A', FluentButton.Kind.Subtle);
         var bRefresh = new FluentButton("", '\uE72C', FluentButton.Kind.Subtle);
         var bSendFiles = new FluentButton(L.T("Send files", "Отправить файлы"), '\uE898', FluentButton.Kind.Subtle);
         var bSendFolder = new FluentButton(L.T("Send folder", "Отправить папку"), '\uE8B7', FluentButton.Kind.Subtle);
+        var bSendText = new FluentButton(L.T("Send text", "Отправить текст"), '', FluentButton.Kind.Subtle);
         bDown = new FluentButton(L.T("Download", "Скачать к себе"), '\uE896', FluentButton.Kind.Subtle);
         bRen = new FluentButton("", '\uE8AC', FluentButton.Kind.Subtle);
         bDel = new FluentButton("", '\uE74D', FluentButton.Kind.Subtle);
         tip.SetToolTip(bUp, L.T("Up (Backspace)", "Вверх (Backspace)")); tip.SetToolTip(bRefresh, L.T("Refresh (F5)", "Обновить (F5)"));
         tip.SetToolTip(bRen, L.T("Rename (F2)", "Переименовать (F2)")); tip.SetToolTip(bDel, L.T("Move to Recycle Bin (Delete)", "Удалить в корзину (Delete)"));
-        bar.Controls.AddRange(new Control[] { bUp, bRefresh, Separator(), bSendFiles, bSendFolder, bDown, Separator(), bRen, bDel });
+        bar.Controls.AddRange(new Control[] { bBack, Separator(), bUp, bRefresh, Separator(), bSendFiles, bSendFolder, bSendText, bDown, Separator(), bRen, bDel });
 
         crumb = new Label { Dock = DockStyle.Top, Height = Theme.S(44), Font = Theme.Subtitle, Padding = new Padding(Theme.S(36), 0, Theme.S(22), 0), TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true };
         crumb.Paint += (s, e) =>
@@ -3115,6 +3135,7 @@ class RemoteForm : BusyForm
         m.Items.Add(new ToolStripSeparator());
         Menus.Item(m, L.T("Send files…", "Отправить файлы…"), '\uE898', null, (s, e) => SendFiles());
         Menus.Item(m, L.T("Send folder…", "Отправить папку…"), '\uE8B7', null, (s, e) => SendFolder());
+        Menus.Item(m, L.T("Send text…", "Отправить текст…"), '', null, (s, e) => SendText());
         Menus.Item(m, L.T("Refresh", "Обновить"), '\uE72C', "F5", (s, e) => Reload());
         m.Opening += (s, e) =>
         {
@@ -3125,9 +3146,11 @@ class RemoteForm : BusyForm
         lv.ContextMenuStrip = m;
 
         bUp.Click += (s, e) => Up();
+        bBack.Click += (s, e) => { var mf = MainForm.Instance; if (mf != null) { mf.Location = Location; mf.ShowMain(); } Close(); };
         bRefresh.Click += (s, e) => Reload();
         bSendFiles.Click += (s, e) => SendFiles();
         bSendFolder.Click += (s, e) => SendFolder();
+        bSendText.Click += (s, e) => SendText();
         bDown.Click += (s, e) => DownloadSelected();
         bRen.Click += (s, e) => BeginRename();
         bDel.Click += (s, e) => DeleteSelected();
@@ -3166,21 +3189,26 @@ class RemoteForm : BusyForm
         return new Panel { Width = 1, Height = Theme.S(20), BackColor = Theme.Stroke, Margin = new Padding(Theme.S(6), Theme.S(8), Theme.S(6), 0) };
     }
 
-    static void Columns(Rectangle row, out Rectangle name, out Rectangle type, out Rectangle size)
+    static void Columns(Rectangle row, out Rectangle name, out Rectangle created, out Rectangle type, out Rectangle size)
     {
-        int sizeW = Theme.S(110), typeW = row.Width > Theme.S(560) ? Theme.S(210) : 0;
+        bool wide = row.Width > Theme.S(560);
+        int sizeW = Theme.S(110), typeW = wide ? Theme.S(150) : 0, dateW = wide ? Theme.S(140) : 0;
         size = new Rectangle(row.Right - sizeW - Theme.S(12), row.Y, sizeW, row.Height);
         type = new Rectangle(size.X - typeW, row.Y, typeW, row.Height);
-        name = new Rectangle(row.X, row.Y, type.X - row.X, row.Height);
+        created = new Rectangle(type.X - dateW, row.Y, dateW, row.Height);
+        name = new Rectangle(row.X, row.Y, created.X - row.X, row.Height);
     }
+
+    static string DateText(long ticks) { return ticks <= 0 ? "" : new DateTime(ticks, DateTimeKind.Utc).ToLocalTime().ToString("g"); }
 
     void DrawHeader(object sender, DrawListViewColumnHeaderEventArgs e)
     {
         using (var b = new SolidBrush(Theme.Bg)) e.Graphics.FillRectangle(b, e.Bounds);
-        Rectangle n, t, sz;
-        Columns(e.Bounds, out n, out t, out sz);
+        Rectangle n, cr, t, sz;
+        Columns(e.Bounds, out n, out cr, out t, out sz);
         var f = TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis;
         TextRenderer.DrawText(e.Graphics, L.T("Name", "Имя"), Theme.Small, new Rectangle(n.X + Theme.S(12), n.Y, n.Width, n.Height), Theme.TextSecondary, f);
+        if (cr.Width > 0) TextRenderer.DrawText(e.Graphics, L.T("Date created", "Дата создания"), Theme.Small, new Rectangle(cr.X + Theme.S(8), cr.Y, cr.Width, cr.Height), Theme.TextSecondary, f);
         if (t.Width > 0) TextRenderer.DrawText(e.Graphics, L.T("Type", "Тип"), Theme.Small, new Rectangle(t.X + Theme.S(8), t.Y, t.Width, t.Height), Theme.TextSecondary, f);
         TextRenderer.DrawText(e.Graphics, L.T("Size", "Размер"), Theme.Small, sz, Theme.TextSecondary, f | TextFormatFlags.Right);
         using (var p = new Pen(Theme.Stroke)) e.Graphics.DrawLine(p, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
@@ -3215,13 +3243,15 @@ class RemoteForm : BusyForm
                     g.FillPath(b, path);
             g.SmoothingMode = SmoothingMode.None;
         }
-        Rectangle n, t, sz;
-        Columns(row, out n, out t, out sz);
+        Rectangle n, cr, t, sz;
+        Columns(row, out n, out cr, out t, out sz);
         var img = e.Item.ImageKey != null && icons.Images.ContainsKey(e.Item.ImageKey) ? icons.Images[e.Item.ImageKey] : null;
         int x = n.X + Theme.S(8);
         if (img != null) { g.DrawImage(img, x, row.Y + (row.Height - img.Height) / 2); x += img.Width + Theme.S(4); }
         var f = TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix;
         TextRenderer.DrawText(g, e.Item.Text, lv.Font, new Rectangle(x, row.Y, n.Right - x - Theme.S(8), row.Height), Theme.Text, f);
+        if (cr.Width > 0 && e.Item.SubItems.Count > 3)
+            TextRenderer.DrawText(g, e.Item.SubItems[3].Text, lv.Font, new Rectangle(cr.X + Theme.S(8), row.Y, cr.Width - Theme.S(8), row.Height), Theme.TextSecondary, f);
         if (t.Width > 0 && e.Item.SubItems.Count > 1)
             TextRenderer.DrawText(g, e.Item.SubItems[1].Text, lv.Font, new Rectangle(t.X + Theme.S(8), row.Y, t.Width - Theme.S(8), row.Height), Theme.TextSecondary, f);
         if (e.Item.SubItems.Count > 2)
@@ -3294,7 +3324,7 @@ class RemoteForm : BusyForm
         foreach (var e in items)
         {
             string type, key = IconKey(e, out type);
-            lv.Items.Add(new ListViewItem(new[] { e.Name, type, e.IsDir ? "" : FormatSize(e.Size) }, key) { Tag = e });
+            lv.Items.Add(new ListViewItem(new[] { e.Name, type, e.IsDir ? "" : FormatSize(e.Size), DateText(e.Created) }, key) { Tag = e });
         }
         lv.EndUpdate();
         UpdateButtons();
@@ -3318,6 +3348,13 @@ class RemoteForm : BusyForm
     {
         using (var d = new OpenFileDialog { Multiselect = true, Title = L.T("Choose files to send to ", "Выберите файлы для отправки на ") + pcName })
             if (d.ShowDialog(this) == DialogResult.OK) Upload(d.FileNames);
+    }
+
+    async void SendText()
+    {
+        string text = TextWindow.Compose(this, L.T("Send text to ", "Отправить текст на ") + pcName);
+        if (text == null) return;
+        await Run(r => Client.SendText(ip, text), L.T("Text sent", "Текст отправлен"));
     }
 
     void SendFolder()
