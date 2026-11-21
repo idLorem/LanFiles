@@ -1,5 +1,7 @@
 ﻿# LanFiles
 
+[![Release](https://img.shields.io/github/v/release/idLorem/LanFiles)](../../releases/latest) [![License](https://img.shields.io/github/license/idLorem/LanFiles)](LICENSE) [![Downloads](https://img.shields.io/github/downloads/idLorem/LanFiles/total)](../../releases)
+
 File sharing between Windows PCs and Android phones on a local network.
 
 Download `LanFiles.exe` (Windows) or `LanFiles.apk` (Android) from [Releases](https://github.com/idLorem/LanFiles/releases). To build from source, run `build.bat` (Windows) or `android\build.bat` (Android).
