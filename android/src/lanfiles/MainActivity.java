@@ -160,13 +160,13 @@ public class MainActivity extends Activity {
             public String pin() { return prefs.getString("myPin", ""); }
             public boolean confirm() { return prefs.getBoolean("confirm", true); }
             public boolean trusted(String from) { Peer p = peers.get(from); return p != null && favOf(p.id) != null; }
-            public CompletableFuture<Boolean> ask(String from, String what, boolean replace) {
+            public CompletableFuture<Boolean> ask(String from, String what) {
                 CompletableFuture<Boolean> f = new CompletableFuture<>();
                 MainActivity a = visible;
-                if (a != null) { a.ui.post(() -> a.askReceive(from, what, f, replace)); return f; }
+                if (a != null) { a.ui.post(() -> a.askReceive(from, what, f)); return f; }
                 // App is in the background: notify, and show the dialog when the user opens it.
                 Peer p = peers.get(from);
-                pendingAsk = new Object[] { p != null ? p.name : from, what, f, replace, from };
+                pendingAsk = new Object[] { p != null ? p.name : from, what, f, from };
                 ReceiveService.ask(ctx, (String) pendingAsk[0], what);
                 new Handler(Looper.getMainLooper()).postDelayed(() -> { f.complete(false); ReceiveService.cancelAsk(ctx); }, 115000);
                 return f;
@@ -329,7 +329,7 @@ public class MainActivity extends Activity {
         if (p != null) {
             @SuppressWarnings("unchecked") CompletableFuture<Boolean> f = (CompletableFuture<Boolean>) p[2];
             ReceiveService.cancelAsk(this);
-            if (!f.isDone()) askReceive((String) p[4], (String) p[1], f, (Boolean) p[3]);
+            if (!f.isDone()) askReceive((String) p[3], (String) p[1], f);
         }
     }
     @Override protected void onPause() { super.onPause(); visible = null; ui.removeCallbacks(tick); }
@@ -933,16 +933,15 @@ public class MainActivity extends Activity {
         }, card, SystemClock.uptimeMillis() + 3000);
     }
 
-    void askReceive(String from, String what, CompletableFuture<Boolean> result, boolean replace) {
+    void askReceive(String from, String what, CompletableFuture<Boolean> result) {
         Peer p = peers.get(from);
         String who = p != null ? p.name : from;
         AlertDialog.Builder b = new AlertDialog.Builder(this);
-        if (replace) b.setNeutralButton(L.t("Replace all", "Заменить все"), (x, w) -> { if (server != null) server.setReplaceAll(from); result.complete(true); });
         AlertDialog d = b
-            .setTitle(replace ? L.t("Replace the existing file?", "Заменить существующий файл?") : who + L.t(" wants to send you files", " хочет отправить вам файлы"))
+            .setTitle(who + L.t(" wants to send you files", " хочет отправить вам файлы"))
             .setMessage(what)
-            .setPositiveButton(replace ? L.t("Replace", "Заменить") : L.t("Accept", "Принять"), (x, w) -> result.complete(true))
-            .setNegativeButton(replace ? L.t("Keep both", "Оставить оба") : L.t("Decline", "Отклонить"), (x, w) -> result.complete(false))
+            .setPositiveButton(L.t("Accept", "Принять"), (x, w) -> result.complete(true))
+            .setNegativeButton(L.t("Decline", "Отклонить"), (x, w) -> result.complete(false))
             .setOnDismissListener(x -> result.complete(false))
             .show();
         ui.postDelayed(() -> { if (d.isShowing()) d.dismiss(); }, 115000);

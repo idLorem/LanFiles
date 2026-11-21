@@ -14,7 +14,7 @@ final class Server {
         /** Starred computers send without asking. */
         boolean trusted(String from);
         /** Shows "X wants to send you files" and completes with the answer. */
-        CompletableFuture<Boolean> ask(String from, String what, boolean replace);
+        CompletableFuture<Boolean> ask(String from, String what);
         void progress(String from, String name, long done, long total);
         void received(String from, File f);
     }
@@ -46,20 +46,6 @@ final class Server {
 
     void stop() { try { listener.close(); } catch (IOException ignored) { } }
 
-    final Map<String, Long> replaceAll = new HashMap<>();
-
-    /** "Replace all" answer from a computer; lasts while its files keep coming. */
-    void setReplaceAll(String from) { synchronized (replaceAll) { replaceAll.put(from, System.currentTimeMillis() + 60000); } }
-
-    boolean replaceAllActive(String from) {
-        synchronized (replaceAll) {
-            Long u = replaceAll.get(from);
-            if (u == null || u < System.currentTimeMillis()) return false;
-            replaceAll.put(from, System.currentTimeMillis() + 60000);
-            return true;
-        }
-    }
-
     static String declined() { return L.t("The recipient declined the files", "Получатель отклонил файлы"); }
 
     boolean gate(String from, String what, int waitSeconds) {
@@ -69,7 +55,7 @@ final class Server {
             Long until = allowed.get(from);
             if (until != null && until > System.currentTimeMillis()) { allowed.put(from, System.currentTimeMillis() + 60000); return true; }
             f = asking.get(from);
-            if (f == null || f.isDone()) asking.put(from, f = host.ask(from, what, false));
+            if (f == null || f.isDone()) asking.put(from, f = host.ask(from, what));
         }
         boolean ok;
         try { ok = f.get(waitSeconds, TimeUnit.SECONDS); } catch (Exception e) { ok = false; }
@@ -103,7 +89,7 @@ final class Server {
             Wire w = new Wire(s);
             try {
                 String pin = w.str(), cmd = w.str(), rel = w.str();
-                long len = cmd.equals("PUT") ? w.i64() : 0;
+                long len = cmd.equals("PUT") || cmd.equals("PUT2") ? w.i64() : 0;
                 String newName = cmd.equals("REN") ? w.str() : null;
                 int offerCount = 0; long offerSize = 0; String offerNames = null;
                 if (cmd.equals("OFFER")) { offerCount = w.i32(); offerSize = w.i64(); offerNames = w.str(); }
@@ -142,14 +128,16 @@ final class Server {
                 }
                 File p = resolve(rel);
                 switch (cmd) {
+                    case "LIST2":
                     case "LIST": {
+                        boolean dates = cmd.equals("LIST2");
                         File[] all = p.listFiles();
                         if (all == null) throw new FileNotFoundException(L.t("Not found: ", "Не найдено: ") + rel);
                         int n = 0;
                         for (File f : all) if (f.isDirectory() || !f.getName().endsWith(".part")) n++;
                         w.bool(true); w.i32(n);
-                        for (File f : all) if (f.isDirectory()) { w.str(f.getName()); w.bool(true); w.i64(0); }
-                        for (File f : all) if (!f.isDirectory() && !f.getName().endsWith(".part")) { w.str(f.getName()); w.bool(false); w.i64(f.length()); }
+                        for (File f : all) if (f.isDirectory()) { w.str(f.getName()); w.bool(true); w.i64(0); if (dates) w.i64(f.lastModified() * 10000L + 621355968000000000L); }
+                        for (File f : all) if (!f.isDirectory() && !f.getName().endsWith(".part")) { w.str(f.getName()); w.bool(false); w.i64(f.length()); if (dates) w.i64(f.lastModified() * 10000L + 621355968000000000L); }
                         break;
                     }
                     case "MKD":
@@ -167,7 +155,8 @@ final class Server {
                             Net.copy(f, w.out, n, p.getName(), null, null);
                         }
                         break;
-                    case "PUT": {
+                    case "PUT":
+                    case "PUT2": {
                         if (isRoot(p)) throw new IOException(L.t("Empty file name", "Пустое имя файла"));
                         Net.checkName(p.getName());
                         File dir = p.getParentFile();
@@ -175,11 +164,17 @@ final class Server {
                         if (root.getUsableSpace() < len) throw new IOException(L.t("Not enough disk space", "Недостаточно места на диске"));
                         if (!gate(from, p.getName() + ", " + L.size(len), 50)) throw new IOException(declined());
                         boolean replace = false;
-                        if (p.isFile() && replaceAllActive(from)) replace = true;
-                        else if (p.isFile()) {
-                            try { replace = host.ask(from, p.getName(), true).get(50, TimeUnit.SECONDS); } catch (Exception e) { replace = false; }
-                        }
-                        w.bool(true); w.flush();
+                        if (cmd.equals("PUT2")) { // the sender decides about an existing file: 0 keep both, 1 replace, 2 skip
+                            boolean exists = p.isFile();
+                            w.bool(true); w.bool(exists); w.flush();
+                            if (exists) {
+                                s.setSoTimeout(600000);
+                                int d = w.in.read();
+                                s.setSoTimeout(60000);
+                                if (d == 2) { w.bool(true); w.flush(); break; }
+                                replace = d == 1;
+                            }
+                        } else { w.bool(true); w.flush(); }
                         File saved = Net.receive(w.in, len, p, (name, done, total) -> host.progress(from, name, done, total), null, replace);
                         synchronized (allowed) { if (allowed.containsKey(from)) allowed.put(from, System.currentTimeMillis() + 60000); }
                         w.bool(true);
