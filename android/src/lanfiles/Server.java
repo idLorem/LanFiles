@@ -14,7 +14,7 @@ final class Server {
         /** Starred computers send without asking. */
         boolean trusted(String from);
         /** Shows "X wants to send you files" and completes with the answer. */
-        CompletableFuture<Boolean> ask(String from, String what);
+        CompletableFuture<Boolean> ask(String from, String what, boolean replace);
         void progress(String from, String name, long done, long total);
         void received(String from, File f);
     }
@@ -55,7 +55,7 @@ final class Server {
             Long until = allowed.get(from);
             if (until != null && until > System.currentTimeMillis()) { allowed.put(from, System.currentTimeMillis() + 60000); return true; }
             f = asking.get(from);
-            if (f == null || f.isDone()) asking.put(from, f = host.ask(from, what));
+            if (f == null || f.isDone()) asking.put(from, f = host.ask(from, what, false));
         }
         boolean ok;
         try { ok = f.get(waitSeconds, TimeUnit.SECONDS); } catch (Exception e) { ok = false; }
@@ -160,8 +160,12 @@ final class Server {
                         if (!dir.mkdirs() && !dir.isDirectory()) throw new IOException(L.t("Cannot create folder ", "Не удалось создать папку ") + dir.getName());
                         if (root.getUsableSpace() < len) throw new IOException(L.t("Not enough disk space", "Недостаточно места на диске"));
                         if (!gate(from, p.getName() + ", " + L.size(len), 50)) throw new IOException(declined());
+                        boolean replace = false;
+                        if (p.isFile()) {
+                            try { replace = host.ask(from, p.getName(), true).get(50, TimeUnit.SECONDS); } catch (Exception e) { replace = false; }
+                        }
                         w.bool(true); w.flush();
-                        File saved = Net.receive(w.in, len, p, (name, done, total) -> host.progress(from, name, done, total), null);
+                        File saved = Net.receive(w.in, len, p, (name, done, total) -> host.progress(from, name, done, total), null, replace);
                         synchronized (allowed) { if (allowed.containsKey(from)) allowed.put(from, System.currentTimeMillis() + 60000); }
                         w.bool(true);
                         host.received(from, saved);

@@ -20,7 +20,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: System.Reflection.AssemblyVersion("1.6.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.6.1.0")]
 
 static class L
 {
@@ -42,7 +42,7 @@ static class Program
     static readonly Dictionary<string, string> known = new Dictionary<string, string>();
     public static bool TrayOnClose = true, ExplorerMenu = true, CheckUpdates = true, ConfirmReceive = true;
     static readonly List<string> favorites = new List<string>();
-    public static Func<string, string, Func<bool>, Task<bool>> AskReceive;
+    public static Func<string, string, Func<bool>, bool, Task<bool>> AskReceive; // last arg: "replace existing file?" instead of "accept files?"
 
     public class Incoming { public string Ip, Name; public long Total, Done; public TcpClient Sock; public readonly Stopwatch Clock = Stopwatch.StartNew(); }
     public static readonly List<Incoming> Incomings = new List<Incoming>();
@@ -403,13 +403,18 @@ static class Program
         }
     }
 
-    public static string ReceiveFile(Stream src, long n, string target, Action<long> progress)
+    public static string ReceiveFile(Stream src, long n, string target, Action<long> progress, bool replace = false)
     {
-        lock (receiving) { target = UniquePath(target); receiving.Add(target); }
+        lock (receiving)
+        {
+            if (!(replace && File.Exists(target) && !receiving.Contains(target) && !File.Exists(target + ".part"))) target = UniquePath(target);
+            receiving.Add(target);
+        }
         string part = target + ".part";
         try
         {
             using (var f = File.Create(part)) Copy(src, f, n, progress);
+            if (replace && File.Exists(target)) File.Delete(target);
             File.Move(part, target);
         }
         catch { try { File.Delete(part); } catch (IOException) { } throw; }
@@ -537,13 +542,20 @@ static class Program
             string one = Path.Combine(src, "a.txt"), big = Path.Combine(src, "sub", "big.bin");
             int asked = 0; bool answer = false;
             ConfirmReceive = true;
-            AskReceive = (i, w, a) => { asked++; return Task.FromResult(answer); };
+            AskReceive = (i, w, a, r) => { asked++; return Task.FromResult(answer); };
             Assert(Throws(() => Client.Offer(ip, "", new[] { one })) && asked == 1, "declined offer");
             Assert(Throws(() => Client.SendFile(ip, one, "d.txt", s)) && !File.Exists(Path.Combine(share2, "d.txt")), "put without approval refused");
             answer = true;
             Client.Offer(ip, "", new[] { one });
             Client.SendFile(ip, one, "d.txt", s);
             Assert(File.Exists(Path.Combine(share2, "d.txt")) && asked == 3, "accepted offer lets files in");
+            File.WriteAllText(Path.Combine(src, "r1.txt"), "NEW"); File.WriteAllText(Path.Combine(src, "r2.txt"), "OTHER");
+            asked = 0;
+            Client.SendFile(ip, Path.Combine(src, "r1.txt"), "d.txt", s);
+            Assert(asked == 1 && File.ReadAllText(Path.Combine(share2, "d.txt")) == "NEW" && !File.Exists(Path.Combine(share2, "d (1).txt")), "same name: replace accepted");
+            answer = false;
+            Client.SendFile(ip, Path.Combine(src, "r2.txt"), "d.txt", s);
+            Assert(asked == 2 && File.ReadAllText(Path.Combine(share2, "d.txt")) == "NEW" && File.ReadAllText(Path.Combine(share2, "d (1).txt")) == "OTHER", "same name: replace declined keeps both");
             Server.Revoke(ip, false); answer = false; asked = 0;
             SetFavorite(ip, true);
             Client.Offer(ip, "", new[] { one });
@@ -551,7 +563,7 @@ static class Program
             SetFavorite(ip, false);
             Assert(!IsFavorite(ip) && Throws(() => Client.Offer(ip, "", new[] { one })), "unstarred is asked again");
             var promptGone = new TaskCompletionSource<bool>();
-            AskReceive = (i, w, a) => Task.Run(() =>
+            AskReceive = (i, w, a, r) => Task.Run(() =>
             {
                 for (int k = 0; k < 100; k++) { if (!a()) { promptGone.TrySetResult(true); return false; } Thread.Sleep(50); }
                 promptGone.TrySetResult(false); return false;
@@ -843,7 +855,7 @@ static class Server
             if (!asking.TryGetValue(from, out ask) || ask.IsCompleted)
             {
                 var h = Program.AskReceive;
-                asking[from] = ask = h == null ? Task.FromResult(false) : h(from, what, () => Alive(sock));
+                asking[from] = ask = h == null ? Task.FromResult(false) : h(from, what, () => Alive(sock), false);
             }
         }
         bool ok = ask.Wait(TimeSpan.FromSeconds(waitSeconds)) && ask.Result;
@@ -959,11 +971,17 @@ static class Server
                     Directory.CreateDirectory(Path.GetDirectoryName(p));
                     if (new DriveInfo(Path.GetPathRoot(p)).AvailableFreeSpace < len) throw new IOException(L.T("Not enough disk space", "Недостаточно места на диске"));
                     if (!Gate(from, Path.GetFileName(p) + ", " + RemoteForm.FormatSize(len), 50, c.Client)) throw new IOException(Declined);
+                    bool replace = false;
+                    if (File.Exists(p) && Program.AskReceive != null)
+                    {
+                        var t = Program.AskReceive(from, Path.GetFileName(p), () => Alive(c.Client), true);
+                        replace = t.Wait(TimeSpan.FromSeconds(50)) && t.Result;
+                    }
                     Interlocked.Increment(ref Program.Receiving);
                     var inc = new Program.Incoming { Ip = from, Name = Path.GetFileName(p), Total = len, Sock = c };
                     lock (Program.Incomings) Program.Incomings.Add(inc);
                     string saved;
-                    try { w.Write(true); w.Flush(); saved = Program.ReceiveFile(s, len, p, d => Interlocked.Exchange(ref inc.Done, d)); }
+                    try { w.Write(true); w.Flush(); saved = Program.ReceiveFile(s, len, p, d => Interlocked.Exchange(ref inc.Done, d), replace); }
                     finally
                     {
                         lock (Program.Incomings) Program.Incomings.Remove(inc);
@@ -1192,7 +1210,9 @@ static class Client
         using (var c = new Conn(ip, "PUT", rel))
         {
             c.W.Write(f.Length);
+            c.C.ReceiveTimeout = 150000; // the recipient may be answering two questions
             c.CheckOk();
+            c.C.ReceiveTimeout = 60000;
             try { Program.Copy(f, c.S, f.Length, Progress(status, L.T("Sending: ", "Отправка: ") + Path.GetFileName(local), f.Length)); }
             catch (IOException) { throw new IOException(L.T("The transfer was interrupted: the recipient canceled it or went offline", "Передача прервана: получатель отменил её или отключился")); }
             c.CheckOk();
@@ -1996,10 +2016,10 @@ class MainForm : Form
         incomingTimer.Tick += (s, e) => ShowIncoming();
         incomingTimer.Start();
         CreateHandle();
-        Program.AskReceive = (ip, what, alive) =>
+        Program.AskReceive = (ip, what, alive, replace) =>
         {
             var tcs = new TaskCompletionSource<bool>();
-            try { BeginInvoke((Action)(() => AskReceive(ip, what, alive, tcs))); }
+            try { BeginInvoke((Action)(() => AskReceive(ip, what, alive, tcs, replace))); }
             catch (InvalidOperationException) { tcs.TrySetResult(false); }
             return tcs.Task;
         };
@@ -2069,7 +2089,7 @@ class MainForm : Form
         }
     }
 
-    void AskReceive(string ip, string what, Func<bool> alive, TaskCompletionSource<bool> result)
+    void AskReceive(string ip, string what, Func<bool> alive, TaskCompletionSource<bool> result, bool replace)
     {
         string name = NameOf(ip);
         var f = new Form();
@@ -2078,20 +2098,21 @@ class MainForm : Form
         f.FormBorderStyle = FormBorderStyle.FixedSingle; f.MaximizeBox = f.MinimizeBox = false;
         f.StartPosition = FormStartPosition.CenterScreen; f.TopMost = true;
         int w = Theme.S(400), pad = Theme.S(24);
-        var title = new Label { Text = name + L.T(" wants to send you files", " хочет отправить вам файлы"), Font = Theme.Subtitle, AutoEllipsis = true, Location = new Point(pad, Theme.S(20)), Size = new Size(w, Theme.S(32)) };
+        var title = new Label { Text = replace ? L.T("Replace the existing file?", "Заменить существующий файл?") : name + L.T(" wants to send you files", " хочет отправить вам файлы"), Font = Theme.Subtitle, AutoEllipsis = true, Location = new Point(pad, Theme.S(20)), Size = new Size(w, Theme.S(32)) };
         var sub = new Label { Text = what, ForeColor = Theme.TextSecondary, AutoEllipsis = true, Location = new Point(pad, Theme.S(56)), Size = new Size(w, Theme.S(44)) };
         var fav = new Toggle();
         fav.Location = new Point(pad + w - fav.Width, Theme.S(112));
         var favText = new Label { Text = L.T("Always accept from this computer", "Всегда принимать с этого компьютера"), AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft, Location = new Point(pad, fav.Top), Size = new Size(w - fav.Width - Theme.S(12), fav.Height) };
         favText.Click += (s, e) => fav.Checked = !fav.Checked;
         var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = Theme.S(68), FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(Theme.S(18), Theme.S(16), Theme.S(18), 0), BackColor = Color.FromArgb(28, 28, 28) };
-        var ok = new FluentButton(L.T("Accept", "Принять"), '\0', FluentButton.Kind.Accent) { Width = Theme.S(140) };
-        var no = new FluentButton(L.T("Decline", "Отклонить")) { Width = Theme.S(120) };
+        var ok = new FluentButton(replace ? L.T("Replace", "Заменить") : L.T("Accept", "Принять"), '\0', FluentButton.Kind.Accent) { Width = Theme.S(140) };
+        var no = new FluentButton(replace ? L.T("Keep both", "Оставить оба") : L.T("Decline", "Отклонить")) { Width = Theme.S(120) };
+        if (replace) { fav.Visible = favText.Visible = false; fav.Checked = false; sub.Text = name + ": " + what; }
         ok.Margin = no.Margin = new Padding(Theme.S(4), 0, Theme.S(4), 0);
         bottom.Controls.Add(no); bottom.Controls.Add(ok);
         f.CancelButton = no;
         f.Controls.Add(title); f.Controls.Add(sub); f.Controls.Add(fav); f.Controls.Add(favText); f.Controls.Add(bottom);
-        f.ClientSize = new Size(w + 2 * pad, fav.Bottom + Theme.S(24) + bottom.Height);
+        f.ClientSize = new Size(w + 2 * pad, (replace ? sub.Bottom : fav.Bottom) + Theme.S(24) + bottom.Height);
         bool accepted = false;
         ok.Click += (s, e) => { accepted = true; f.Close(); };
         no.Click += (s, e) => f.Close();

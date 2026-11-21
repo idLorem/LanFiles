@@ -118,7 +118,9 @@ final class Net {
     static void sendFile(String ip, InputStream src, long len, String rel, Progress p, Cancel cancel) throws IOException {
         try (Conn c = new Conn(ip, "PUT", rel, cancel)) {
             c.w.i64(len);
+            c.s.setSoTimeout(150000); // the recipient may be answering two questions
             c.ok();
+            c.s.setSoTimeout(60000);
             try { copy(src, c.w.out, len, nameOf(rel), p, cancel); c.w.flush(); }
             catch (IOException e) {
                 if (cancel != null && cancel.canceled) throw new Canceled();
@@ -193,16 +195,20 @@ final class Net {
 
     /** Writes n bytes to a .part file, then renames it to a free name next to target. */
     static File receive(InputStream src, long n, File target, Progress p, Cancel cancel) throws IOException {
+        return receive(src, n, target, p, cancel, false);
+    }
+
+    static File receive(InputStream src, long n, File target, Progress p, Cancel cancel, boolean replace) throws IOException {
         File part;
         synchronized (receiving) {
-            target = unique(target);
+            if (!(replace && target.isFile() && !new File(target.getPath() + ".part").exists())) target = unique(target);
             part = new File(target.getPath() + ".part");
             new FileOutputStream(part).close();
         }
         try {
             try (OutputStream f = new BufferedOutputStream(new FileOutputStream(part), 1 << 16)) { copy(src, f, n, target.getName(), p, cancel); }
             synchronized (receiving) {
-                if (target.exists()) target = unique(target);
+                if (target.exists() && !(replace && target.isFile() && target.delete())) target = unique(target);
                 if (!part.renameTo(target)) throw new IOException(L.t("Cannot save ", "Не удалось сохранить ") + target.getName());
             }
             return target;
