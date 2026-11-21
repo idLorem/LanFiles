@@ -20,7 +20,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: System.Reflection.AssemblyVersion("1.6.1.0")]
+[assembly: System.Reflection.AssemblyVersion("1.6.2.0")]
 
 static class L
 {
@@ -77,14 +77,29 @@ static class Program
 
     static string PhoneKey(string ip) { return IdOf(ip) ?? ip; }
 
-    public static bool IsPhone(string ip) { lock (phones) return phones.Contains(PhoneKey(ip)); }
+    // Card icon: 0 computer, 1 smartphone, 2 TV, 3 server. Stored in `phones`: "key" = phone (as before), "key#tv", "key#srv".
+    static readonly string[] iconSuffix = { null, "", "#tv", "#srv" };
 
-    public static void SetPhone(string ip, bool on)
+    public static int IconOf(string ip)
     {
         string k = PhoneKey(ip);
-        lock (phones) { phones.Remove(k); if (on) phones.Add(k); }
+        lock (phones) for (int i = 1; i < iconSuffix.Length; i++) if (phones.Contains(k + iconSuffix[i])) return i;
+        return 0;
+    }
+
+    public static void SetIcon(string ip, int kind)
+    {
+        string k = PhoneKey(ip);
+        lock (phones)
+        {
+            for (int i = 1; i < iconSuffix.Length; i++) phones.Remove(k + iconSuffix[i]);
+            if (kind > 0) phones.Add(k + iconSuffix[kind]);
+        }
         if (!noDisk) try { SaveSettings(); } catch (IOException) { } catch (UnauthorizedAccessException) { }
     }
+
+    public static bool IsPhone(string ip) { return IconOf(ip) == 1; }
+    public static void SetPhone(string ip, bool on) { SetIcon(ip, on ? 1 : 0); }
     public static string PcName = "";
     public static string MyName { get { return PcName != "" ? PcName : Environment.MachineName; } }
 
@@ -334,6 +349,25 @@ static class Program
         var h = Received; if (h != null) h(ip, top);
     }
 
+    public static event Action<string, string> TextReceived;
+    public static void OnText(string ip, string text)
+    {
+        var h = TextReceived; if (h != null) h(ip, text);
+    }
+
+    // "Replace all" answer from a computer; lasts while its files keep coming.
+    static readonly Dictionary<string, DateTime> replaceAll = new Dictionary<string, DateTime>();
+    public static void ReplaceAll(string ip) { lock (replaceAll) replaceAll[ip] = DateTime.Now.AddMinutes(1); }
+    public static bool ReplaceAllActive(string ip)
+    {
+        lock (replaceAll)
+        {
+            DateTime u;
+            if (!replaceAll.TryGetValue(ip, out u) || u < DateTime.Now) return false;
+            replaceAll[ip] = DateTime.Now.AddMinutes(1); return true;
+        }
+    }
+
     public static string Resolve(List<string> roots, string rel, out string root)
     {
         if (rel == "*" || rel.StartsWith("*\\")) { root = roots[0]; return SafePath(root, rel.Length > 1 ? rel.Substring(2) : ""); }
@@ -556,6 +590,10 @@ static class Program
             answer = false;
             Client.SendFile(ip, Path.Combine(src, "r2.txt"), "d.txt", s);
             Assert(asked == 2 && File.ReadAllText(Path.Combine(share2, "d.txt")) == "NEW" && File.ReadAllText(Path.Combine(share2, "d (1).txt")) == "OTHER", "same name: replace declined keeps both");
+            ReplaceAll(ip); asked = 0;
+            Client.SendFile(ip, Path.Combine(src, "r2.txt"), "d.txt", s);
+            Assert(asked == 0 && File.ReadAllText(Path.Combine(share2, "d.txt")) == "OTHER", "replace all: no more questions");
+            lock (replaceAll) replaceAll.Remove(ip);
             Server.Revoke(ip, false); answer = false; asked = 0;
             SetFavorite(ip, true);
             Client.Offer(ip, "", new[] { one });
@@ -573,6 +611,10 @@ static class Program
             Throws(() => offerTr.Run(() => Client.Offer(ip, "", new[] { one })));
             Assert(promptGone.Task.Wait(6000) && promptGone.Task.Result, "prompt closes when the sender cancels");
             ConfirmReceive = false; AskReceive = null;
+            string gotText = null;
+            TextReceived += (i, t) => gotText = t;
+            Client.SendText(ip, "привет\nworld");
+            Assert(gotText == "привет\nworld", "text received");
 
             Func<string, bool> gone = n =>
             {
@@ -597,6 +639,10 @@ static class Program
             Assert(IsPhone("10.0.0.6") && !IsPhone("10.0.0.7"), "phone icon follows the device id");
             SetPhone("10.0.0.6", false);
             Assert(!IsPhone("10.0.0.5"), "phone icon cleared");
+            SetIcon("10.0.0.5", 2); SetIcon("10.0.0.5", 3);
+            Assert(IconOf("10.0.0.6") == 3 && !IsPhone("10.0.0.6"), "server icon replaces the previous one");
+            SetIcon("10.0.0.5", 0);
+            Assert(IconOf("10.0.0.6") == 0, "icon cleared");
             using (var raw = new TcpClient(ip, TcpPort))
             {
                 var st = raw.GetStream();
@@ -934,6 +980,14 @@ static class Server
                     w.Write(true); w.Write(accepted); w.Flush();
                     return;
                 }
+                if (cmd == "TEXT")
+                {
+                    string text = r.ReadText();
+                    if (!Gate(from, L.T("Text, ", "Текст, ") + text.Length + L.T(" characters", " символов"), 120, c.Client)) throw new IOException(Declined);
+                    Program.OnText(from, text);
+                    w.Write(true); w.Flush();
+                    return;
+                }
                 var roots = Program.Roots;
                 string root, p = Program.Resolve(roots, rel, out root);
                 if (root == null)
@@ -972,7 +1026,8 @@ static class Server
                     if (new DriveInfo(Path.GetPathRoot(p)).AvailableFreeSpace < len) throw new IOException(L.T("Not enough disk space", "Недостаточно места на диске"));
                     if (!Gate(from, Path.GetFileName(p) + ", " + RemoteForm.FormatSize(len), 50, c.Client)) throw new IOException(Declined);
                     bool replace = false;
-                    if (File.Exists(p) && Program.AskReceive != null)
+                    if (File.Exists(p) && Program.ReplaceAllActive(from)) replace = true;
+                    else if (File.Exists(p) && Program.AskReceive != null)
                     {
                         var t = Program.AskReceive(from, Path.GetFileName(p), () => Alive(c.Client), true);
                         replace = t.Wait(TimeSpan.FromSeconds(50)) && t.Result;
@@ -1030,10 +1085,13 @@ class SafeReader : BinaryReader
 {
     public SafeReader(Stream s) : base(s, Encoding.UTF8) { }
 
-    public override string ReadString()
+    public override string ReadString() { return ReadStr(65536); }
+    public string ReadText() { return ReadStr(1 << 20); }
+
+    string ReadStr(int max)
     {
         int n = Read7BitEncodedInt();
-        if (n < 0 || n > 65536) throw new IOException("Bad request");
+        if (n < 0 || n > max) throw new IOException("Bad request");
         var b = ReadBytes(n);
         if (b.Length != n) throw new EndOfStreamException();
         return Encoding.UTF8.GetString(b);
@@ -1232,6 +1290,16 @@ static class Client
             catch (IOException) { return; }
             if (msg == Program.BadPin) throw new PinException();
             if (!accepted) throw new IOException(L.T("The recipient declined the files", "Получатель отклонил файлы"));
+        }
+    }
+
+    public static void SendText(string ip, string text)
+    {
+        using (var c = new Conn(ip, "TEXT", "*"))
+        {
+            c.W.Write(text);
+            c.C.ReceiveTimeout = 150000;
+            c.CheckOk();
         }
     }
 
@@ -1714,7 +1782,9 @@ class RoundPanel : Panel
 class PcCard : Button
 {
     public string Title, Sub;
-    public bool DropHighlight, Local, MonoSub, Favorite, CanStar, Phone;
+    public bool DropHighlight, Local, MonoSub, Favorite, CanStar;
+    public int Icon; // see Program.IconOf
+    public static char IconGlyph(int kind) { return kind == 1 ? '' : kind == 2 ? '' : kind == 3 ? '' : ''; }
     public static Rectangle CollapseBox { get { return new Rectangle(Theme.S(196) - Theme.S(40), Theme.S(4), Theme.S(36), Theme.S(36)); } }
     bool collapsed;
     public bool Collapsed
@@ -1754,7 +1824,7 @@ class PcCard : Button
         if (collapsed) { Theme.DrawGlyph(g, '\uE80F', new Rectangle(0, 0, Width, Height), Theme.TextSecondary, Theme.S(24)); return; }
         if (Local) Theme.DrawGlyph(g, '\uE70E', CollapseBox, Theme.TextTertiary, Theme.S(12));
         else if (CanStar && (Favorite || hover)) Theme.DrawGlyph(g, Favorite ? '\uE735' : '\uE734', CollapseBox, Favorite ? Theme.TextSecondary : Theme.TextTertiary, Theme.S(14));
-        Theme.DrawGlyph(g, Local ? '\uE80F' : Phone ? '\uE8EA' : '\uE977',new Rectangle(0, Theme.S(20), Width, Theme.S(60)), Enabled ? Theme.TextSecondary : Theme.TextTertiary, Theme.S(48));
+        Theme.DrawGlyph(g, Local ? '\uE80F' : IconGlyph(Icon), new Rectangle(0, Theme.S(20), Width, Theme.S(60)), Enabled ? Theme.TextSecondary : Theme.TextTertiary, Theme.S(48));
         TextRenderer.DrawText(g, Title, Theme.Strong, new Rectangle(Theme.S(12), Theme.S(92), Width - Theme.S(24), Theme.S(24)),
             Enabled ? Theme.Text : Theme.TextSecondary, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
         var font = MonoSub ? Theme.Mono : Theme.Small;
@@ -1996,6 +2066,12 @@ class MainForm : Form
         pruneTimer.Start();
         inboxTimer = new System.Windows.Forms.Timer { Interval = 1500 };
         inboxTimer.Tick += (s, e) => FlushInbox();
+        Program.TextReceived += (ip, text) =>
+        {
+            if (IsDisposed) return;
+            try { BeginInvoke((Action)(() => TextWindow.Show(L.T("Text from ", "Текст от ") + NameOf(ip), text))); }
+            catch (InvalidOperationException) { }
+        };
         Program.Received += (ip, top) =>
         {
             if (IsDisposed) return;
@@ -2107,15 +2183,23 @@ class MainForm : Form
         var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = Theme.S(68), FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(Theme.S(18), Theme.S(16), Theme.S(18), 0), BackColor = Color.FromArgb(28, 28, 28) };
         var ok = new FluentButton(replace ? L.T("Replace", "Заменить") : L.T("Accept", "Принять"), '\0', FluentButton.Kind.Accent) { Width = Theme.S(140) };
         var no = new FluentButton(replace ? L.T("Keep both", "Оставить оба") : L.T("Decline", "Отклонить")) { Width = Theme.S(120) };
-        if (replace) { fav.Visible = favText.Visible = false; fav.Checked = false; sub.Text = name + ": " + what; }
+        FluentButton all = null;
+        if (replace)
+        {
+            fav.Visible = favText.Visible = false; fav.Checked = false; sub.Text = name + ": " + what;
+            ok.Width = Theme.S(110); no.Width = Theme.S(120);
+            all = new FluentButton(L.T("Replace all", "Заменить все")) { Width = Theme.S(130), Margin = new Padding(Theme.S(4), 0, Theme.S(4), 0) };
+        }
         ok.Margin = no.Margin = new Padding(Theme.S(4), 0, Theme.S(4), 0);
         bottom.Controls.Add(no); bottom.Controls.Add(ok);
+        if (all != null) bottom.Controls.Add(all);
         f.CancelButton = no;
         f.Controls.Add(title); f.Controls.Add(sub); f.Controls.Add(fav); f.Controls.Add(favText); f.Controls.Add(bottom);
         f.ClientSize = new Size(w + 2 * pad, (replace ? sub.Bottom : fav.Bottom) + Theme.S(24) + bottom.Height);
         bool accepted = false;
         ok.Click += (s, e) => { accepted = true; f.Close(); };
         no.Click += (s, e) => f.Close();
+        if (all != null) all.Click += (s, e) => { Program.ReplaceAll(ip); accepted = true; f.Close(); };
         var clock = Stopwatch.StartNew();
         var timeout = new System.Windows.Forms.Timer { Interval = 500 };
         timeout.Tick += (s, e) => { if (clock.Elapsed.TotalSeconds > 115 || !alive()) f.Close(); };
@@ -2254,13 +2338,22 @@ class MainForm : Form
         {
             string ip = kv.Key, name = kv.Value;
             bool seen = peers.ContainsKey(ip);
-            var card = new PcCard(name, ip) { AllowDrop = true, MonoSub = true, Status = seen ? 1 : 2, CanStar = true, Favorite = Program.IsFavorite(ip), Phone = Program.IsPhone(ip) };
+            var card = new PcCard(name, ip) { AllowDrop = true, MonoSub = true, Status = seen ? 1 : 2, CanStar = true, Favorite = Program.IsFavorite(ip), Icon = Program.IconOf(ip) };
             card.MouseUp += (s, e) =>
             {
                 if (e.Button != MouseButtons.Right) return;
                 var m = Menus.Create();
-                Menus.Item(m, L.T("Computer icon", "Значок «Компьютер»"), '', null, (s2, e2) => { Program.SetPhone(ip, false); card.Phone = false; card.Invalidate(); }).Checked = !card.Phone;
-                Menus.Item(m, L.T("Smartphone icon", "Значок «Смартфон»"), '', null, (s2, e2) => { Program.SetPhone(ip, true); card.Phone = true; card.Invalidate(); }).Checked = card.Phone;
+                Menus.Item(m, L.T("Send files…", "Отправить файлы…"), '', null, (s2, e2) => SendFilesTo(ip));
+                Menus.Item(m, L.T("Send folder…", "Отправить папку…"), '', null, (s2, e2) => SendFolderTo(ip));
+                Menus.Item(m, L.T("Send text…", "Отправить текст…"), '', null, (s2, e2) => SendText(ip));
+                m.Items.Add(new ToolStripSeparator());
+                var kinds = new[] { L.T("Computer icon", "Значок «Компьютер»"), L.T("Smartphone icon", "Значок «Смартфон»"), L.T("TV icon", "Значок «Телевизор»"), L.T("Server icon", "Значок «Сервер»") };
+                for (int k = 0; k < kinds.Length; k++)
+                {
+                    int kind = k;
+                    var it = Menus.Item(m, kinds[k], PcCard.IconGlyph(k), null, (s2, e2) => { Program.SetIcon(ip, kind); card.Icon = kind; card.Invalidate(); });
+                    if (card.Icon == k) it.Font = Theme.Strong; // current choice is bold, no check box
+                }
                 m.Show(Cursor.Position);
             };
             card.Click += (s, e) =>
@@ -2296,6 +2389,41 @@ class MainForm : Form
                 ? new PcCard(L.T("Looking for computers…", "Поиск компьютеров…"), L.T("Run LanFiles on another computer in this network", "Запустите LanFiles на другом компьютере этой сети")) { Enabled = false }
                 : new PcCard(L.T("No computers found", "Компьютеры не найдены"), L.T("Run LanFiles on another computer and click Search", "Запустите LanFiles на другом компьютере и нажмите «Найти»")) { Enabled = false });
         cards.ResumeLayout();
+    }
+
+    async void SendFilesTo(string ip)
+    {
+        string name = NameOf(ip);
+        List<string> files;
+        using (var d = new OpenFileDialog { Multiselect = true, Title = L.T("Choose files to send to ", "Выберите файлы для отправки на ") + name })
+        {
+            if (d.ShowDialog(this) != DialogResult.OK) return;
+            files = d.FileNames.ToList();
+        }
+        string dir = await FolderPick.Ask(ip, name);
+        if (dir != null) SendBatch(ip, files, dir);
+    }
+
+    async void SendFolderTo(string ip)
+    {
+        string name = NameOf(ip);
+        string p = FolderPicker.Pick(this, L.T("Choose a folder to send to ", "Выберите папку для отправки на ") + name, null);
+        if (p == null) return;
+        string dir = await FolderPick.Ask(ip, name);
+        if (dir != null) SendBatch(ip, new List<string> { p }, dir);
+    }
+
+    async void SendText(string ip)
+    {
+        string name = NameOf(ip);
+        string text = TextWindow.Compose(this, L.T("Send text to ", "Отправить текст на ") + name);
+        if (text == null) return;
+        try
+        {
+            await PinPrompt.Retry(() => { Client.SendText(ip, text); return true; }, () => !IsDisposed && PinPrompt.Ask(Visible ? this : null, ip, name));
+            Notify(L.T("Sent to ", "Отправлено на ") + name, L.T("Text", "Текст"), null);
+        }
+        catch (Exception e) { Notify(L.T("Could not send to ", "Не удалось отправить на ") + name, e.Message, null, true); }
     }
 
     void OpenRemote(string ip, string name)
@@ -2428,6 +2556,84 @@ static class PinPrompt
             catch (IOException) { Program.RememberPin(ip, box.Value, false); }
             catch (UnauthorizedAccessException) { Program.RememberPin(ip, box.Value, false); }
             return true;
+        }
+    }
+}
+
+static class TextWindow
+{
+    static Form Make(string title, string text, bool edit, out TextBox box, out FlowLayoutPanel bottom)
+    {
+        var f = new Form();
+        Theme.Apply(f);
+        f.Text = title; f.Icon = Program.AppIcon;
+        f.StartPosition = FormStartPosition.CenterScreen;
+        f.ClientSize = new Size(Theme.S(520), Theme.S(380)); f.MinimumSize = f.Size;
+        var host = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Input, Padding = new Padding(Theme.S(12)) };
+        box = new TextBox { Multiline = true, ScrollBars = ScrollBars.Vertical, BorderStyle = BorderStyle.None, BackColor = Theme.Input, ForeColor = Theme.Text, Font = Theme.Body,
+            Dock = DockStyle.Fill, ReadOnly = !edit, AcceptsReturn = true, MaxLength = 1 << 19, Text = text.Replace("\r\n", "\n").Replace("\n", "\r\n") };
+        host.Controls.Add(box);
+        bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = Theme.S(68), FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(Theme.S(18), Theme.S(16), Theme.S(18), 0), BackColor = Color.FromArgb(28, 28, 28) };
+        f.Controls.Add(host); f.Controls.Add(bottom);
+        return f;
+    }
+
+    static FluentButton Btn(string text, int w, bool accent = false)
+    {
+        return new FluentButton(text, '\0', accent ? FluentButton.Kind.Accent : FluentButton.Kind.Standard) { Width = Theme.S(w), Margin = new Padding(Theme.S(4), 0, Theme.S(4), 0) };
+    }
+
+    /// <summary>Window for the received text: copy it or save it as .txt.</summary>
+    public static void Show(string title, string text)
+    {
+        TextBox box; FlowLayoutPanel bottom;
+        var f = Make(title, text, false, out box, out bottom);
+        var close = Btn(L.T("Close", "Закрыть"), 110); var save = Btn(L.T("Save as .txt", "Сохранить как .txt"), 160); var copy = Btn(L.T("Copy", "Копировать"), 130, true);
+        bottom.Controls.Add(close); bottom.Controls.Add(save); bottom.Controls.Add(copy);
+        f.CancelButton = close;
+        close.Click += (s, e) => f.Close();
+        copy.Click += (s, e) => { try { Clipboard.SetText(text); copy.Text = L.T("Copied", "Скопировано"); } catch (ExternalException) { } };
+        save.Click += (s, e) =>
+        {
+            using (var d = new SaveFileDialog { Filter = "Text|*.txt", FileName = "text.txt", DefaultExt = "txt" })
+                if (d.ShowDialog(f) == DialogResult.OK)
+                    try { File.WriteAllText(d.FileName, text, new UTF8Encoding(false)); } catch (Exception ex) { MessageBox.Show(f, ex.Message, "LanFiles", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+        };
+        f.Show(); f.Activate();
+    }
+
+    /// <summary>Window to type or paste the text to send. Returns null when canceled.</summary>
+    public static string Compose(IWin32Window owner, string title)
+    {
+        TextBox box; FlowLayoutPanel bottom;
+        using (var f = Make(title, "", true, out box, out bottom))
+        {
+            var cancel = Btn(L.T("Cancel", "Отмена"), 110); var send = Btn(L.T("Send", "Отправить"), 130, true); var paste = Btn(L.T("Paste", "Вставить"), 120);
+            bottom.Controls.Add(cancel); bottom.Controls.Add(send); bottom.Controls.Add(paste);
+            f.CancelButton = cancel;
+            paste.Click += (s, e) =>
+            {
+                try
+                {
+                    if (Clipboard.ContainsText()) box.SelectedText = Clipboard.GetText();
+                    else if (Clipboard.ContainsFileDropList())
+                    {
+                        var file = Clipboard.GetFileDropList().Cast<string>().FirstOrDefault(File.Exists);
+                        if (file != null && new FileInfo(file).Length <= 1 << 19) box.SelectedText = File.ReadAllText(file);
+                    }
+                }
+                catch (ExternalException) { }
+                catch (IOException) { }
+                box.Focus();
+            };
+            send.Click += (s, e) =>
+            {
+                if (box.Text.Trim() == "") return;
+                if (Encoding.UTF8.GetByteCount(box.Text) > 1 << 20) { MessageBox.Show(f, L.T("The text is too long", "Текст слишком длинный"), "LanFiles", MessageBoxButtons.OK, MessageBoxIcon.Error); return; }
+                f.DialogResult = DialogResult.OK;
+            };
+            f.Shown += (s, e) => box.Focus();
+            return f.ShowDialog(owner) == DialogResult.OK ? box.Text : null;
         }
     }
 }

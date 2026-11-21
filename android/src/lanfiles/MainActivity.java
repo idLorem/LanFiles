@@ -166,7 +166,7 @@ public class MainActivity extends Activity {
                 if (a != null) { a.ui.post(() -> a.askReceive(from, what, f, replace)); return f; }
                 // App is in the background: notify, and show the dialog when the user opens it.
                 Peer p = peers.get(from);
-                pendingAsk = new Object[] { p != null ? p.name : from, what, f, replace };
+                pendingAsk = new Object[] { p != null ? p.name : from, what, f, replace, from };
                 ReceiveService.ask(ctx, (String) pendingAsk[0], what);
                 new Handler(Looper.getMainLooper()).postDelayed(() -> { f.complete(false); ReceiveService.cancelAsk(ctx); }, 115000);
                 return f;
@@ -329,7 +329,7 @@ public class MainActivity extends Activity {
         if (p != null) {
             @SuppressWarnings("unchecked") CompletableFuture<Boolean> f = (CompletableFuture<Boolean>) p[2];
             ReceiveService.cancelAsk(this);
-            if (!f.isDone()) askReceive((String) p[0], (String) p[1], f, (Boolean) p[3]);
+            if (!f.isDone()) askReceive((String) p[4], (String) p[1], f, (Boolean) p[3]);
         }
     }
     @Override protected void onPause() { super.onPause(); visible = null; ui.removeCallbacks(tick); }
@@ -936,7 +936,9 @@ public class MainActivity extends Activity {
     void askReceive(String from, String what, CompletableFuture<Boolean> result, boolean replace) {
         Peer p = peers.get(from);
         String who = p != null ? p.name : from;
-        AlertDialog d = new AlertDialog.Builder(this)
+        AlertDialog.Builder b = new AlertDialog.Builder(this);
+        if (replace) b.setNeutralButton(L.t("Replace all", "Заменить все"), (x, w) -> { if (server != null) server.setReplaceAll(from); result.complete(true); });
+        AlertDialog d = b
             .setTitle(replace ? L.t("Replace the existing file?", "Заменить существующий файл?") : who + L.t(" wants to send you files", " хочет отправить вам файлы"))
             .setMessage(what)
             .setPositiveButton(replace ? L.t("Replace", "Заменить") : L.t("Accept", "Принять"), (x, w) -> result.complete(true))

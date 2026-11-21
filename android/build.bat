@@ -6,8 +6,8 @@ set BT=%SDK%\build-tools\36.0.0
 set JAR=%SDK%\platforms\android-34\android.jar
 set JDK=C:\Program Files\Android\Android Studio\jbr\bin
 set PATH=%JDK%;%PATH%
-set VER=1.6.1
-set CODE=10601
+set VER=1.6.2
+set CODE=10602
 
 if exist build rmdir /s /q build
 mkdir build\gen build\classes build\dex

@@ -46,6 +46,20 @@ final class Server {
 
     void stop() { try { listener.close(); } catch (IOException ignored) { } }
 
+    final Map<String, Long> replaceAll = new HashMap<>();
+
+    /** "Replace all" answer from a computer; lasts while its files keep coming. */
+    void setReplaceAll(String from) { synchronized (replaceAll) { replaceAll.put(from, System.currentTimeMillis() + 60000); } }
+
+    boolean replaceAllActive(String from) {
+        synchronized (replaceAll) {
+            Long u = replaceAll.get(from);
+            if (u == null || u < System.currentTimeMillis()) return false;
+            replaceAll.put(from, System.currentTimeMillis() + 60000);
+            return true;
+        }
+    }
+
     static String declined() { return L.t("The recipient declined the files", "Получатель отклонил файлы"); }
 
     boolean gate(String from, String what, int waitSeconds) {
@@ -161,7 +175,8 @@ final class Server {
                         if (root.getUsableSpace() < len) throw new IOException(L.t("Not enough disk space", "Недостаточно места на диске"));
                         if (!gate(from, p.getName() + ", " + L.size(len), 50)) throw new IOException(declined());
                         boolean replace = false;
-                        if (p.isFile()) {
+                        if (p.isFile() && replaceAllActive(from)) replace = true;
+                        else if (p.isFile()) {
                             try { replace = host.ask(from, p.getName(), true).get(50, TimeUnit.SECONDS); } catch (Exception e) { replace = false; }
                         }
                         w.bool(true); w.flush();
