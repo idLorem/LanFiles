@@ -20,7 +20,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: System.Reflection.AssemblyVersion("1.6.4.0")]
+[assembly: System.Reflection.AssemblyVersion("1.6.5.0")]
 
 static class L
 {
@@ -435,8 +435,14 @@ static class Program
         try
         {
             using (var f = File.Create(part)) Copy(src, f, n, progress);
-            if (replace && File.Exists(target)) File.Delete(target);
-            File.Move(part, target);
+            if (replace && File.Exists(target))
+            {
+                string old = UniquePath(target + ".old"); // works on network shares too; the old file comes back if the move fails
+                File.Move(target, old);
+                try { File.Move(part, target); } catch { File.Move(old, target); throw; }
+                File.Delete(old);
+            }
+            else File.Move(part, target);
         }
         catch { try { File.Delete(part); } catch (IOException) { } throw; }
         finally { lock (receiving) receiving.Remove(target); }
@@ -640,6 +646,19 @@ static class Program
             Assert(IconOf("10.0.0.6") == 3 && !IsPhone("10.0.0.6"), "server icon replaces the previous one");
             SetIcon("10.0.0.5", 0);
             Assert(IconOf("10.0.0.6") == 0, "icon cleared");
+            foreach (bool ru in new[] { false, true })
+                using (var raw = new TcpClient(ip, TcpPort))
+                {
+                    bool was = L.Ru; L.Ru = ru;
+                    var rw = new BinaryWriter(raw.GetStream(), Encoding.UTF8);
+                    rw.Write(PinFor(ip)); rw.Write("NOPE"); rw.Write("*"); rw.Flush();
+                    var rr = new BinaryReader(raw.GetStream(), Encoding.UTF8);
+                    rr.ReadBoolean(); string msg = rr.ReadString(); L.Ru = was;
+                    Assert(Client.IsUnknown(new IOException(msg)), "unknown command recognized in any language: " + msg);
+                }
+            File.WriteAllText(Path.Combine(share, "h.txt.part"), "x");
+            Assert(!Client.List(ip, "*").Any(e => e.Name.EndsWith(".part")), "unfinished files are not listed");
+            Assert(Throws(() => Client.List(ip, "no such folder")) && Client.List(ip, "*").Any(e => e.Modified > 0), "an error does not drop the dates");
             using (var raw = new TcpClient(ip, TcpPort))
             {
                 var st = raw.GetStream();
@@ -957,17 +976,23 @@ static class Server
                 }
                 if (pin != Program.Pin)
                 {
-                    lock (failLock) Thread.Sleep(1000);
-                    lock (fails)
+                    lock (fails) // count before the pause, so parallel guesses hit the limit too
                     {
                         int n;
                         fails.TryGetValue(from, out n);
                         if (++n >= MaxFails) { fails.Remove(from); blocked[from] = DateTime.Now.AddMinutes(10); }
                         else fails[from] = n;
                     }
+                    lock (failLock) Thread.Sleep(1000);
                     throw new UnauthorizedAccessException(Program.BadPin);
                 }
-                lock (fails) fails.Remove(from);
+                lock (fails)
+                {
+                    DateTime until; // blocked by a parallel wrong guess: answer like a wrong password, so the right one is not revealed
+                    if (blocked.TryGetValue(from, out until) && until > DateTime.Now) pin = null;
+                    else fails.Remove(from);
+                }
+                if (pin == null) { lock (failLock) Thread.Sleep(1000); throw new UnauthorizedAccessException(Program.BadPin); }
                 if (cmd == "OFFER")
                 {
                     string names = string.Join(", ", offerNames.Split('\n').Select(Program.CleanName).Where(n => n != "").Take(3));
@@ -999,7 +1024,7 @@ static class Server
                 {
                     bool withDate = cmd == "LIST2";
                     var di = new DirectoryInfo(p);
-                    var dirs = di.GetDirectories(); var files = di.GetFiles();
+                    var dirs = di.GetDirectories(); var files = di.GetFiles().Where(f => !f.Name.EndsWith(".part", StringComparison.OrdinalIgnoreCase)).ToArray();
                     w.Write(true); w.Write(dirs.Length + files.Length);
                     foreach (var d in dirs) { w.Write(d.Name); w.Write(true); w.Write(0L); if (withDate) w.Write(d.LastWriteTimeUtc.Ticks); }
                     foreach (var f in files) { w.Write(f.Name); w.Write(false); w.Write(f.Length); if (withDate) w.Write(f.LastWriteTimeUtc.Ticks); }
@@ -1020,9 +1045,10 @@ static class Server
                 else if (cmd == "PUT" || cmd == "PUT2")
                 {
                     if (Program.IsRoot(root, p)) throw new IOException(L.T("Empty file name", "Пустое имя файла"));
-                    Directory.CreateDirectory(Path.GetDirectoryName(p));
+                    Program.CheckName(Path.GetFileName(p));
                     if (new DriveInfo(Path.GetPathRoot(p)).AvailableFreeSpace < len) throw new IOException(L.T("Not enough disk space", "Недостаточно места на диске"));
                     if (!Gate(from, Path.GetFileName(p) + ", " + RemoteForm.FormatSize(len), 50, c.Client)) throw new IOException(Declined);
+                    Directory.CreateDirectory(Path.GetDirectoryName(p));
                     bool replace = false;
                     if (cmd == "PUT2") // the sender decides about an existing file: 0 keep both, 1 replace, 2 skip
                     {
@@ -1033,7 +1059,7 @@ static class Server
                             c.ReceiveTimeout = 600000;
                             int d = r.ReadByte();
                             c.ReceiveTimeout = 60000;
-                            if (d == 2) { w.Write(true); w.Flush(); return; }
+                            if (d == 2) { Touch(from); w.Write(true); w.Flush(); return; }
                             replace = d == 1;
                         }
                     }
@@ -1190,6 +1216,9 @@ static class Client
         return (pct >= 0 ? s + " — " + pct + "%" : s) + speed;
     }
 
+    /// <summary>An older version that does not know the command; it answers in its own language.</summary>
+    public static bool IsUnknown(Exception e) { return e.Message == "Unknown command" || e.Message == "Неизвестная команда"; }
+
     static readonly HashSet<string> noDates = new HashSet<string>(); // computers that only know LIST (older versions, Android)
 
     public static List<Entry> List(string ip, string rel)
@@ -1198,8 +1227,11 @@ static class Client
         if (!old)
         {
             try { return ReadList(ip, rel, true); }
-            catch (PinException) { throw; }
-            catch (IOException) { lock (noDates) noDates.Add(ip); } // unknown command, or a real error that the plain LIST will report again
+            catch (IOException e)
+            {
+                if (e is PinException) throw;
+                if (IsUnknown(e)) lock (noDates) noDates.Add(ip); // any other error: the plain LIST reports it again, or works on an old computer with several shared folders
+            }
         }
         return ReadList(ip, rel, false);
     }
@@ -1305,7 +1337,7 @@ static class Client
             try { SendFile(ip, local, rel, status, true); return; }
             catch (IOException e)
             {
-                if (e.Message != L.T("Unknown command", "Неизвестная команда")) throw;
+                if (!IsUnknown(e)) throw;
                 lock (noPut2) noPut2.Add(ip);
             }
         }

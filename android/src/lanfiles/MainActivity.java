@@ -78,7 +78,7 @@ public class MainActivity extends Activity {
         ReceiveService.sync(this);
         handleInstall(getIntent());
         handleShare(getIntent());
-        showMain();
+        if (prefs.getString("myPin", "").isEmpty()) showSettings(); else showMain();
         if (!updateChecked && prefs.getBoolean("checkUpdates", true)) { updateChecked = true; checkUpdate(false); }
     }
 
@@ -1120,7 +1120,7 @@ public class MainActivity extends Activity {
         EditText name = input(prefs.getString("name", ""), Build.MODEL, false);
         f.addView(name);
         f.addView(label(L.t("Password for access to this phone", "Пароль для доступа к телефону")));
-        EditText pin = input(prefs.getString("myPin", ""), L.t("No password", "Без пароля"), true);
+        EditText pin = input(prefs.getString("myPin", ""), L.t("Required", "Обязательно"), true);
         f.addView(pin);
         Switch confirm = new Switch(this);
         confirm.setText(L.t("Ask before receiving files", "Спрашивать перед приёмом файлов"));
@@ -1182,6 +1182,7 @@ public class MainActivity extends Activity {
         f.addView(ver);
 
         View save = pillButton(0, L.t("Save", "Сохранить"), true, v -> {
+            if (pin.getText().toString().isEmpty()) { toast(L.t("Set a password: without it anyone on the network can open and delete your files", "Задайте пароль: без него любой в сети может открыть и удалить ваши файлы")); return; }
             prefs.edit().putString("name", L.cleanName(name.getText().toString())).putString("myPin", pin.getText().toString())
                 .putBoolean("confirm", confirm.isChecked()).putBoolean("background", bg.isChecked()).putBoolean("checkUpdates", upd.isChecked()).apply();
             ReceiveService.sync(this);

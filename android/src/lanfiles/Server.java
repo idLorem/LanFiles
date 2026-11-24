@@ -46,6 +46,8 @@ final class Server {
 
     void stop() { try { listener.close(); } catch (IOException ignored) { } }
 
+    void touch(String from) { synchronized (allowed) { if (allowed.containsKey(from)) allowed.put(from, System.currentTimeMillis() + 60000); } }
+
     static String declined() { return L.t("The recipient declined the files", "Получатель отклонил файлы"); }
 
     boolean gate(String from, String what, int waitSeconds) {
@@ -101,16 +103,23 @@ final class Server {
                         blocked.remove(from);
                     }
                 }
+                if (host.pin().isEmpty()) throw new IOException(L.t("Set a password in LanFiles on the phone", "Задайте пароль в LanFiles на телефоне"));
                 if (!pin.equals(host.pin())) {
-                    Thread.sleep(1000);
-                    synchronized (fails) {
+                    synchronized (fails) { // count before the pause, so parallel guesses hit the limit too
                         int n = fails.getOrDefault(from, 0) + 1;
                         if (n >= MAX_FAILS) { fails.remove(from); blocked.put(from, System.currentTimeMillis() + 600000); }
                         else fails.put(from, n);
                     }
+                    Thread.sleep(1000);
                     throw new IOException(Net.BAD_PIN);
                 }
-                synchronized (fails) { fails.remove(from); }
+                boolean late;
+                synchronized (fails) {
+                    Long until = blocked.get(from); // blocked by a parallel wrong guess: answer like a wrong password, so the right one is not revealed
+                    late = until != null && until > System.currentTimeMillis();
+                    if (!late) fails.remove(from);
+                }
+                if (late) { Thread.sleep(1000); throw new IOException(Net.BAD_PIN); }
                 if (cmd.equals("OFFER")) {
                     StringBuilder names = new StringBuilder();
                     int shown = 0;
@@ -159,10 +168,10 @@ final class Server {
                     case "PUT2": {
                         if (isRoot(p)) throw new IOException(L.t("Empty file name", "Пустое имя файла"));
                         Net.checkName(p.getName());
-                        File dir = p.getParentFile();
-                        if (!dir.mkdirs() && !dir.isDirectory()) throw new IOException(L.t("Cannot create folder ", "Не удалось создать папку ") + dir.getName());
                         if (root.getUsableSpace() < len) throw new IOException(L.t("Not enough disk space", "Недостаточно места на диске"));
                         if (!gate(from, p.getName() + ", " + L.size(len), 50)) throw new IOException(declined());
+                        File dir = p.getParentFile();
+                        if (!dir.mkdirs() && !dir.isDirectory()) throw new IOException(L.t("Cannot create folder ", "Не удалось создать папку ") + dir.getName());
                         boolean replace = false;
                         if (cmd.equals("PUT2")) { // the sender decides about an existing file: 0 keep both, 1 replace, 2 skip
                             boolean exists = p.isFile();
@@ -171,12 +180,12 @@ final class Server {
                                 s.setSoTimeout(600000);
                                 int d = w.in.read();
                                 s.setSoTimeout(60000);
-                                if (d == 2) { w.bool(true); w.flush(); break; }
+                                if (d == 2) { touch(from); w.bool(true); w.flush(); break; }
                                 replace = d == 1;
                             }
                         } else { w.bool(true); w.flush(); }
                         File saved = Net.receive(w.in, len, p, (name, done, total) -> host.progress(from, name, done, total), null, replace);
-                        synchronized (allowed) { if (allowed.containsKey(from)) allowed.put(from, System.currentTimeMillis() + 60000); }
+                        touch(from);
                         w.bool(true);
                         host.received(from, saved);
                         break;

@@ -30,13 +30,16 @@ public class ProtoTest {
         tmp.mkdirs();
         File got = Net.download(ip, "Документы\\тест.bin", false, tmp, null, null);
         check(Arrays.equals(java.nio.file.Files.readAllBytes(got.toPath()), data), "PUT then GET round trip");
+        check(put2(ip, a[1], "Документы\\тест.bin", 2, null) && sizeOf(ip, "тест.bin") == data.length, "PUT2 skip keeps the file");
+        check(put2(ip, a[1], "Документы\\тест.bin", 1, "abc".getBytes()) && sizeOf(ip, "тест.bin") == 3, "PUT2 replace");
+        check(!put2(ip, a[1], "Документы\\новый.bin", 1, "abcd".getBytes()) && sizeOf(ip, "новый.bin") == 4, "PUT2 new file is not asked about");
         Net.makeDir(ip, "Новая папка");
         Net.rename(ip, "Новая папка", "Переименовано");
         check(Net.list(ip, "").stream().anyMatch(e -> e.name.equals("Переименовано")), "MKD + REN");
         Net.delete(ip, "Переименовано");
         check(Net.list(ip, "").stream().noneMatch(e -> e.name.equals("Переименовано")), "DEL");
         File d = Net.download(ip, "Документы", true, tmp, null, null);
-        check(new File(d, "тест.bin").length() == data.length, "folder download");
+        check(new File(d, "тест.bin").length() == 3, "folder download");
         try { Net.list(ip, "..\\.."); check(false, "path escape rejected"); } catch (IOException e) { check(true, "path escape rejected: " + e.getMessage()); }
         Net.Cancel c = new Net.Cancel();
         new Thread(() -> { try { Thread.sleep(150); } catch (InterruptedException ignored) { } c.cancel(); }).start();
@@ -46,6 +49,26 @@ public class ProtoTest {
             check(false, "cancel stops PUT");
         } catch (Net.Canceled e) { check(true, "cancel stops PUT"); }
         System.out.println("ALL OK");
+    }
+
+    static long sizeOf(String ip, String name) throws IOException {
+        for (Net.Entry e : Net.list(ip, "Документы")) if (e.name.equals(name)) return e.size;
+        return -1;
+    }
+
+    /** Raw PUT2; returns whether the receiver said the file exists. decision: 0 keep both, 1 replace, 2 skip. */
+    static boolean put2(String ip, String pin, String rel, int decision, byte[] body) throws IOException {
+        try (java.net.Socket s = new java.net.Socket("127.0.0.1", Net.TCP)) {
+            s.setSoTimeout(10000);
+            Wire w = new Wire(s);
+            w.str(pin); w.str("PUT2"); w.str(rel); w.i64(body == null ? 0 : body.length); w.flush();
+            if (!w.bool()) throw new IOException(w.str());
+            boolean exists = w.bool();
+            if (exists) { w.out.write(decision); w.flush(); }
+            if (!exists || decision != 2) { w.out.write(body); w.flush(); }
+            if (!w.bool()) throw new IOException(w.str());
+            return exists;
+        }
     }
 
     static void server(File dir, String pin) throws Exception {

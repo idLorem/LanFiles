@@ -143,7 +143,7 @@ final class Net {
         try (Conn c = new Conn(ip, "GET", rel, cancel)) {
             c.ok();
             long len = c.w.i64();
-            try { return receive(c.w.in, len, new File(localDir, name), p, cancel); }
+            try { return receive(c.w.in, len, new File(localDir, name), p, cancel, false); }
             catch (IOException e) { if (cancel != null && cancel.canceled) throw new Canceled(); throw e; }
         }
     }
@@ -194,10 +194,6 @@ final class Net {
     }
 
     /** Writes n bytes to a .part file, then renames it to a free name next to target. */
-    static File receive(InputStream src, long n, File target, Progress p, Cancel cancel) throws IOException {
-        return receive(src, n, target, p, cancel, false);
-    }
-
     static File receive(InputStream src, long n, File target, Progress p, Cancel cancel, boolean replace) throws IOException {
         File part;
         synchronized (receiving) {
@@ -208,8 +204,11 @@ final class Net {
         try {
             try (OutputStream f = new BufferedOutputStream(new FileOutputStream(part), 1 << 16)) { copy(src, f, n, target.getName(), p, cancel); }
             synchronized (receiving) {
-                if (target.exists() && !(replace && target.isFile() && target.delete())) target = unique(target);
-                if (!part.renameTo(target)) throw new IOException(L.t("Cannot save ", "Не удалось сохранить ") + target.getName());
+                if (replace && target.isFile()) java.nio.file.Files.move(part.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING); // old file stays if the move fails
+                else {
+                    if (target.exists()) target = unique(target);
+                    if (!part.renameTo(target)) throw new IOException(L.t("Cannot save ", "Не удалось сохранить ") + target.getName());
+                }
             }
             return target;
         } catch (IOException e) {
